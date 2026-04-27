@@ -295,16 +295,23 @@ impl Bot {
     }
 
     async fn cmd_state(&self, msg: &InboundMessage) -> Result<()> {
-        let snap = {
+        let prep = {
             let games = self.games.lock();
-            games
-                .get(&msg.chat_id)
-                .map(|g| snapshot_for(g, Some(msg.sender_open_id.as_str())))
-        }
-        .ok_or_else(|| anyhow!("当前没有牌局"))?;
-        // If the requester happens to be the current actor, hand them buttons too.
+            let game = games.get(&msg.chat_id).ok_or_else(|| anyhow!("当前没有牌局"))?;
+            let snap = snapshot_for(game, Some(msg.sender_open_id.as_str()));
+            let n_opp = game
+                .players
+                .iter()
+                .filter(|p| {
+                    !p.folded && !p.sat_out && p.open_id != msg.sender_open_id
+                })
+                .count();
+            (snap, n_opp)
+        };
+        let (snap, n_opp) = prep;
         let am_actor = snap.current_open_id.as_deref() == Some(msg.sender_open_id.as_str());
-        let c = build_state_card(&snap, am_actor);
+        let stats = compute_viewer_stats(&snap, &msg.sender_open_id, n_opp);
+        let c = build_state_card(&snap, stats.as_ref(), am_actor);
         self.send_user_only(msg, &c).await?;
         Ok(())
     }
@@ -601,20 +608,28 @@ impl Bot {
     /// rebuilt under the lock so it carries the actor's hole cards — the
     /// caller's snapshot might not have them.
     async fn post_actor_prompt(&self, chat_id: &str) -> Result<()> {
-        let payload = {
+        let prep = {
             let games = self.games.lock();
             let Some(g) = games.get(chat_id) else { return Ok(()); };
             let Some(actor_id) = g.current_player_open_id().map(String::from) else {
                 return Ok(());
             };
             let snap = snapshot_for(g, Some(&actor_id));
-            Some((build_state_card(&snap, true), actor_id))
+            let n_opp = g
+                .players
+                .iter()
+                .filter(|p| !p.folded && !p.sat_out && p.open_id != actor_id)
+                .count();
+            Some((snap, actor_id, n_opp))
         };
-        if let Some((card, actor_id)) = payload {
-            self.client
-                .send_ephemeral_card(chat_id, &actor_id, &card)
-                .await?;
-        }
+        let Some((snap, actor_id, n_opp)) = prep else { return Ok(()); };
+
+        // Compute equity outside the lock — Monte Carlo is ~50–250ms.
+        let stats = compute_viewer_stats(&snap, &actor_id, n_opp);
+        let card = build_state_card(&snap, stats.as_ref(), true);
+        self.client
+            .send_ephemeral_card(chat_id, &actor_id, &card)
+            .await?;
         Ok(())
     }
 
@@ -905,14 +920,15 @@ impl Bot {
         cli.send_message("chat_id", chat_id, "interactive",
             &send_label(n, "状态卡 - 公开版 (无按钮)")).await?;
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_state_card(&snap_mid_flop, false)).await?;
+            &build_state_card(&snap_mid_flop, None, false)).await?;
 
         // --------- 9. state - private with form + buttons ---------
         let n = step("state actor");
         cli.send_message("chat_id", chat_id, "interactive",
             &send_label(n, "行动卡 - 私人版 (form + input + 按钮)")).await?;
+        let mock_stats = compute_viewer_stats(&snap_mid_flop, &alice, 1);
         cli.send_ephemeral_card(chat_id, &alice,
-            &build_state_card(&snap_mid_flop, true)).await?;
+            &build_state_card(&snap_mid_flop, mock_stats.as_ref(), true)).await?;
 
         // --------- 10. action announcement ---------
         let n = step("action announce");
@@ -1284,7 +1300,47 @@ fn build_lobby_card(snap: &GameSnapshot) -> Value {
 /// Render the full game state. If `include_buttons` is true the card also
 /// shows the actor-specific call amount and the action buttons — only ever
 /// rendered into an ephemeral message sent to the actor themselves.
-fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
+/// Hero stats embedded into the state card for the viewing player. None when
+/// the snapshot has no hole cards (public state card, or non-player viewer).
+#[derive(Debug, Clone, Copy)]
+pub struct ViewerStats {
+    pub equity: f64,
+    pub pot: u64,
+    pub to_call: u64,
+}
+
+/// Build the equity / pot-odds / EV bundle for a snapshot's viewer. Returns
+/// None if the viewer has no hole cards or no opponents are still in.
+fn compute_viewer_stats(
+    snap: &GameSnapshot,
+    viewer_open_id: &str,
+    n_opponents: usize,
+) -> Option<ViewerStats> {
+    if snap.viewer_hole.is_empty() || n_opponents == 0 {
+        return None;
+    }
+    let in_progress = matches!(
+        snap.stage,
+        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
+    );
+    if !in_progress {
+        return None;
+    }
+    let equity = crate::poker::equity(&snap.viewer_hole, &snap.community, n_opponents, 2000);
+    let to_call = snap
+        .players
+        .iter()
+        .find(|p| p.open_id == viewer_open_id)
+        .map(|p| snap.current_bet.saturating_sub(p.bet_in_round))
+        .unwrap_or(0);
+    Some(ViewerStats {
+        equity,
+        pot: snap.pot,
+        to_call,
+    })
+}
+
+fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_buttons: bool) -> Value {
     let actor = snap.current_open_id.as_deref();
 
     let subtitle = format!(
@@ -1347,6 +1403,12 @@ fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
                 elements.push(cards_row(&snap.viewer_hole));
             }
 
+            // Equity / pot odds / naive call EV. Computed off the lock and
+            // passed in via `stats`.
+            if let Some(s) = stats {
+                elements.push(markdown(&render_stats_line(s)));
+            }
+
             elements.push(markdown(&format!(
                 "🎯 **你的回合** · 剩余筹码 **{}** · 需要跟注 **{}**",
                 p.chips, to_call
@@ -1367,6 +1429,16 @@ fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
             elements.push(note("仅你可见 · 群里其他人看不到这些按钮"));
         }
     } else if in_progress {
+        // Non-actor viewing /poker state: still show their hole cards + equity
+        // so the command is useful even when it's not their turn.
+        if !snap.viewer_hole.is_empty() {
+            elements.push(hr());
+            elements.push(markdown("**你的手牌**"));
+            elements.push(cards_row(&snap.viewer_hole));
+            if let Some(s) = stats {
+                elements.push(markdown(&render_stats_line(s)));
+            }
+        }
         if let Some(open_id) = actor {
             elements.push(note(&format!("{} 行动中…", at(open_id))));
         }
@@ -1378,6 +1450,23 @@ fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
         header_with_subtitle("🎰 德州扑克", &subtitle, "wathet"),
         elements,
     )
+}
+
+/// `胜率 47% · 底池赔率 21% · 跟注 EV +12` — pot odds & EV only when there's
+/// a non-zero call to make.
+fn render_stats_line(s: &ViewerStats) -> String {
+    let mut line = format!("胜率 **{:.0}%**", s.equity * 100.0);
+    if s.to_call > 0 {
+        let pot_after = (s.pot + s.to_call) as f64;
+        let pot_odds = s.to_call as f64 / pot_after;
+        let ev = s.equity * pot_after - s.to_call as f64;
+        line.push_str(&format!(
+            " · 底池赔率 **{:.0}%** · 跟注 EV **{:+.0}**",
+            pot_odds * 100.0,
+            ev
+        ));
+    }
+    line
 }
 
 /// Fold + (Check / Call) + All-in. The form-input below handles custom raises.
