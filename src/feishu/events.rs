@@ -8,6 +8,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
+    pub event_id: String,
     pub message_id: String,
     pub chat_id: String,
     pub chat_type: String, // "group" | "p2p"
@@ -23,7 +24,13 @@ pub struct Mention {
     pub open_id: String,
 }
 
-pub fn parse_inbound_message(event: &Value) -> Option<InboundMessage> {
+pub fn parse_inbound_message(payload: &Value) -> Option<InboundMessage> {
+    let event_id = payload
+        .pointer("/header/event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let event = payload.get("event").unwrap_or(payload);
     let sender = event.pointer("/sender/sender_id/open_id")?.as_str()?;
     let m = event.get("message")?;
     let chat_id = m.get("chat_id")?.as_str()?;
@@ -50,6 +57,7 @@ pub fn parse_inbound_message(event: &Value) -> Option<InboundMessage> {
         }
     }
     Some(InboundMessage {
+        event_id,
         message_id: message_id.to_string(),
         chat_id: chat_id.to_string(),
         chat_type: chat_type.to_string(),
@@ -62,6 +70,10 @@ pub fn parse_inbound_message(event: &Value) -> Option<InboundMessage> {
 
 #[derive(Debug, Clone)]
 pub struct CardAction {
+    /// Stable identifier the bot uses to dedupe duplicate deliveries of the
+    /// same click — Feishu may invoke the callback URL more than once for a
+    /// single user action (retries, schema-version mirroring, etc.).
+    pub event_id: String,
     pub open_id: String,
     pub open_chat_id: String,
     pub open_message_id: String,
@@ -73,6 +85,7 @@ pub struct CardAction {
 
 #[derive(Debug, Clone)]
 pub struct MemberAdded {
+    pub event_id: String,
     pub chat_id: String,
     pub users: Vec<AddedUser>,
 }
@@ -83,8 +96,14 @@ pub struct AddedUser {
     pub name: String,
 }
 
-/// Parse a `im.chat.member.user.added_v1` event payload's `event` block.
-pub fn parse_member_added(event: &Value) -> Option<MemberAdded> {
+/// Parse a `im.chat.member.user.added_v1` event payload (full body, with header).
+pub fn parse_member_added(payload: &Value) -> Option<MemberAdded> {
+    let event_id = payload
+        .pointer("/header/event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let event = payload.get("event").unwrap_or(payload);
     let chat_id = event.get("chat_id")?.as_str()?.to_string();
     let users_arr = event.get("users")?.as_array()?;
     let users: Vec<AddedUser> = users_arr
@@ -102,7 +121,11 @@ pub fn parse_member_added(event: &Value) -> Option<MemberAdded> {
     if users.is_empty() {
         None
     } else {
-        Some(MemberAdded { chat_id, users })
+        Some(MemberAdded {
+            event_id,
+            chat_id,
+            users,
+        })
     }
 }
 
@@ -115,6 +138,11 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
         if header.get("event_type")?.as_str()? != "card.action.trigger" {
             return None;
         }
+        let event_id = header
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let event = payload.get("event")?;
         let open_id = event.pointer("/operator/open_id")?.as_str()?.to_string();
         let open_chat_id = event
@@ -133,6 +161,7 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
             .cloned()
             .unwrap_or(Value::Null);
         return Some(CardAction {
+            event_id,
             open_id,
             open_chat_id,
             open_message_id,
@@ -142,6 +171,12 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
     }
 
     // Legacy flat payload from the card request URL
+    let event_id = payload
+        .get("uuid")
+        .or_else(|| payload.get("event_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let open_id = payload.get("open_id")?.as_str()?.to_string();
     let open_chat_id = payload
         .get("open_chat_id")
@@ -162,6 +197,7 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
         .cloned()
         .unwrap_or(Value::Null);
     Some(CardAction {
+        event_id,
         open_id,
         open_chat_id,
         open_message_id,

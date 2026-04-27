@@ -60,27 +60,23 @@ async fn event_handler(State(state): State<AppState>, Json(body): Json<Value>) -
 
     match event_type {
         "im.message.receive_v1" => {
-            if let Some(event) = body.get("event") {
-                if let Some(msg) = parse_inbound_message(event) {
-                    let bot = state.bot.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = bot.handle_message(msg).await {
-                            warn!(?e, "message handler error");
-                        }
-                    });
-                }
+            if let Some(msg) = parse_inbound_message(&body) {
+                let bot = state.bot.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bot.handle_message(msg).await {
+                        warn!(?e, "message handler error");
+                    }
+                });
             }
         }
         "im.chat.member.user.added_v1" => {
-            if let Some(event) = body.get("event") {
-                if let Some(evt) = parse_member_added(event) {
-                    let bot = state.bot.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = bot.handle_member_added(evt).await {
-                            warn!(?e, "member_added handler error");
-                        }
-                    });
-                }
+            if let Some(evt) = parse_member_added(&body) {
+                let bot = state.bot.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bot.handle_member_added(evt).await {
+                        warn!(?e, "member_added handler error");
+                    }
+                });
             }
         }
         // url_verification can also arrive in v2 schema header form

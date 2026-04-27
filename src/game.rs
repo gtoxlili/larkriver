@@ -202,10 +202,33 @@ impl Game {
     }
 
     /// Begin a new hand. Requires ≥ 2 active (chip-holding) players.
+    ///
+    /// Tolerates a stuck mid-hand state: if the previous hand never reached a
+    /// proper showdown (player walked away, message dropped, whatever), every
+    /// player's outstanding bet is refunded to their stack and the table is
+    /// reset before the new deal. The pot is effectively voided — this is a
+    /// pragmatic call for a casual chat-room game where being able to start
+    /// over matters more than strict pot-correctness.
     pub fn start_hand(&mut self) -> Result<()> {
-        if !matches!(self.stage, Stage::Lobby | Stage::Ended) {
-            return Err(anyhow!("已经在牌局中"));
+        if matches!(
+            self.stage,
+            Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River | Stage::Showdown
+        ) {
+            for p in &mut self.players {
+                p.chips = p.chips.saturating_add(p.total_bet);
+                p.total_bet = 0;
+                p.bet_in_round = 0;
+                p.folded = false;
+                p.all_in = false;
+                p.acted_this_round = false;
+                p.hole.clear();
+            }
+            self.community.clear();
+            self.action_log.clear();
+            self.current_bet = 0;
+            self.stage = Stage::Ended;
         }
+
         let active: Vec<usize> = self
             .players
             .iter()
@@ -793,6 +816,29 @@ mod tests {
         let last = g.act("a", PlayerAction::Check).unwrap();
         assert_eq!(g.stage, Stage::Ended);
         assert!(last.summary.is_some());
+    }
+
+    #[test]
+    fn start_hand_recovers_from_stuck_mid_hand() {
+        // Simulate a hand that started but never reached showdown — pot still
+        // has chips, stage is mid-hand. start_hand should refund and restart.
+        let mut g = Game::new("c".into());
+        add(&mut g, "a", "Alice");
+        add(&mut g, "b", "Bob");
+        g.start_hand().unwrap();
+        // Alice raises so there's a real pot in flight, then we abandon.
+        g.act("a", PlayerAction::RaiseTo(40)).unwrap();
+        assert!(g.pot_total() > 0);
+        let chips_before: Vec<u64> = g.players.iter().map(|p| p.chips + p.total_bet).collect();
+
+        // Pretend the hand got stuck — call start_hand again.
+        g.start_hand().unwrap();
+        assert_eq!(g.stage, Stage::PreFlop);
+        // Stacks should have been refunded to pre-bet totals (minus the new blinds posted by start_hand).
+        for (i, p) in g.players.iter().enumerate() {
+            assert_eq!(p.chips + p.bet_in_round, chips_before[i]);
+        }
+        assert_eq!(g.hand_count, 2, "hand counter should advance");
     }
 
     #[test]

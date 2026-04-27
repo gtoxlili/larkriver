@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub struct Bot {
@@ -17,6 +18,11 @@ pub struct Bot {
     cfg: Config,
     games: Mutex<HashMap<String, Game>>, // chat_id → game
     bot_open_id: Mutex<Option<String>>,
+    /// LRU-ish dedup cache for callback `event_id`. Feishu sometimes delivers
+    /// the same callback twice (retries, schema-version mirroring) — without
+    /// this, the second delivery hits a state that's already advanced and the
+    /// user sees a phantom "无法执行" / "还没轮到你" toast on top of the real one.
+    seen_events: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +43,26 @@ impl Bot {
             cfg,
             games: Mutex::new(HashMap::new()),
             bot_open_id: Mutex::new(None),
+            seen_events: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Returns true if `event_id` has been seen in the last ~2 minutes —
+    /// callers should drop the event in that case. Empty `event_id`
+    /// (legacy payloads without one) is never deduped.
+    fn is_duplicate_event(&self, event_id: &str) -> bool {
+        if event_id.is_empty() {
+            return false;
+        }
+        let mut seen = self.seen_events.lock();
+        // Cheap GC: drop entries older than 120s on every insert.
+        seen.retain(|_, t| t.elapsed() < Duration::from_secs(120));
+        if seen.contains_key(event_id) {
+            true
+        } else {
+            seen.insert(event_id.to_string(), Instant::now());
+            false
+        }
     }
 
     pub fn cfg(&self) -> &Config {
@@ -54,6 +79,9 @@ impl Bot {
     }
 
     pub async fn handle_message(self: Arc<Self>, msg: InboundMessage) -> Result<()> {
+        if self.is_duplicate_event(&msg.event_id) {
+            return Ok(());
+        }
         if msg.message_type != "text" {
             return Ok(());
         }
@@ -221,7 +249,7 @@ impl Bot {
             }
             game.players
                 .iter()
-                .map(|p| format!("• {} ({}) — **{}** 筹码", at(&p.open_id), p.name, p.chips))
+                .map(|p| format!("• {} — **{}** 筹码", at(&p.open_id), p.chips))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -231,11 +259,13 @@ impl Bot {
     }
 
     async fn cmd_state(&self, msg: &InboundMessage) -> Result<()> {
-        let snapshot = {
+        let snap = {
             let games = self.games.lock();
-            games.get(&msg.chat_id).map(snapshot)
-        };
-        let snap = snapshot.ok_or_else(|| anyhow!("当前没有牌局"))?;
+            games
+                .get(&msg.chat_id)
+                .map(|g| snapshot_for(g, Some(msg.sender_open_id.as_str())))
+        }
+        .ok_or_else(|| anyhow!("当前没有牌局"))?;
         // If the requester happens to be the current actor, hand them buttons too.
         let am_actor = snap.current_open_id.as_deref() == Some(msg.sender_open_id.as_str());
         let c = build_state_card(&snap, am_actor);
@@ -303,13 +333,16 @@ impl Bot {
             .await;
 
         // Ephemeral state+buttons sent only to the first actor.
-        self.post_actor_prompt(&snap).await?;
+        self.post_actor_prompt(chat_id).await?;
         Ok(())
     }
 
     /// New user(s) added to the group → send each one an ephemeral welcome card
     /// with a [加入下一局] button.
     pub async fn handle_member_added(self: Arc<Self>, evt: MemberAdded) -> Result<()> {
+        if self.is_duplicate_event(&evt.event_id) {
+            return Ok(());
+        }
         if let Some(allowed) = &self.cfg.allowed_chat_id {
             if &evt.chat_id != allowed {
                 return Ok(());
@@ -329,6 +362,9 @@ impl Bot {
     }
 
     pub async fn handle_card_action(self: Arc<Self>, action: CardAction) -> Result<Value> {
+        if self.is_duplicate_event(&action.event_id) {
+            return Ok(json!({}));
+        }
         let Some(action_id) = action
             .value
             .get("action")
@@ -389,15 +425,38 @@ impl Bot {
             .unwrap_or_default();
         let hand = action.value.get("hand").and_then(|v| v.as_u64()).unwrap_or(0);
 
+        // Stale-click guards. Run *before* the actor check so re-clicking an
+        // old ephemeral card surfaces a clear "this card is stale" toast
+        // rather than "现在不是你的回合", which reads as authorization failure.
         {
             let games = self.games.lock();
             if let Some(g) = games.get(&chat_id) {
                 if hand != 0 && hand as u32 != g.hand_count {
                     return Ok(toast("这是上一局的按钮"));
                 }
+                if !actor_id.is_empty() {
+                    match g.stage {
+                        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River => {
+                            if let Some(current) = g.current_player_open_id() {
+                                if current != actor_id {
+                                    return Ok(toast(
+                                        "这张卡片已失效 · 最新行动卡在下方",
+                                    ));
+                                }
+                            }
+                        }
+                        Stage::Lobby | Stage::Ended | Stage::Showdown => {
+                            return Ok(toast(
+                                "本局已结束 · 点大厅卡 [开局] 开始新一局",
+                            ));
+                        }
+                    }
+                }
             }
         }
 
+        // Authorization: someone other than the rendered actor clicked a
+        // currently-valid card.
         if !actor_id.is_empty() && action.open_id != actor_id {
             return Ok(toast("现在不是你的回合"));
         }
@@ -494,22 +553,29 @@ impl Bot {
             let _ = self.refresh_lobby(chat_id).await;
         } else if outcome.next_actor_open_id.is_some() {
             // Buttons go only to the player whose turn it is.
-            let _ = self.post_actor_prompt(&snap).await;
+            let _ = self.post_actor_prompt(chat_id).await;
         }
     }
 
     /// Send the action card (full state + buttons) only to the player whose
-    /// turn it is, as an ephemeral group message. Other players still see the
-    /// public action announcement, which has the post-action state plus the
-    /// "下一位是 X" mention, so they can follow along without seeing the buttons.
-    async fn post_actor_prompt(&self, snap: &GameSnapshot) -> Result<()> {
-        let Some(actor_id) = snap.current_open_id.clone() else {
-            return Ok(());
+    /// turn it is, as an ephemeral group message. The snapshot used here is
+    /// rebuilt under the lock so it carries the actor's hole cards — the
+    /// caller's snapshot might not have them.
+    async fn post_actor_prompt(&self, chat_id: &str) -> Result<()> {
+        let payload = {
+            let games = self.games.lock();
+            let Some(g) = games.get(chat_id) else { return Ok(()); };
+            let Some(actor_id) = g.current_player_open_id().map(String::from) else {
+                return Ok(());
+            };
+            let snap = snapshot_for(g, Some(&actor_id));
+            Some((build_state_card(&snap, true), actor_id))
         };
-        let c = build_state_card(snap, true);
-        self.client
-            .send_ephemeral_card(&snap.chat_id, &actor_id, &c)
-            .await?;
+        if let Some((card, actor_id)) = payload {
+            self.client
+                .send_ephemeral_card(chat_id, &actor_id, &card)
+                .await?;
+        }
         Ok(())
     }
 
@@ -554,6 +620,9 @@ impl Bot {
         snap: &GameSnapshot,
         summary: &HandSummary,
     ) -> Result<()> {
+        // (Display strings switched to at-mentions below — Feishu renders the
+        // user's display name from `<at id=...>` without the bot needing the
+        // contact:user.base:readonly scope.)
         let mut elements = vec![];
 
         if !summary.showdowns.is_empty() {
@@ -564,9 +633,8 @@ impl Bot {
             for s in &summary.showdowns {
                 let p = &snap.players[s.player_idx];
                 elements.push(markdown(&format!(
-                    "{} **{}** · {}",
+                    "{} · {}",
                     at(&p.open_id),
-                    p.name,
                     category_name(s.rank.category)
                 )));
                 elements.push(markdown("手牌"));
@@ -586,10 +654,7 @@ impl Bot {
             let winner_names = payout
                 .winners
                 .iter()
-                .map(|i| {
-                    let p = &snap.players[*i];
-                    format!("{} **{}**", at(&p.open_id), p.name)
-                })
+                .map(|i| at(&snap.players[*i].open_id))
                 .collect::<Vec<_>>()
                 .join("、");
             let line = if payout.winners.is_empty() {
@@ -606,7 +671,7 @@ impl Bot {
         let chips_line = snap
             .players
             .iter()
-            .map(|p| format!("{}: {}", p.name, p.chips))
+            .map(|p| format!("{}: {}", at(&p.open_id), p.chips))
             .collect::<Vec<_>>()
             .join(" · ");
         elements.push(note(&format!(
@@ -709,6 +774,7 @@ impl Bot {
             community: vec![],
             pot: 0, current_bet: 0, min_raise: 10, big_blind: 10,
             dealer_idx: 0, current_open_id: None, players: vec![],
+            viewer_hole: vec![],
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_empty)).await?;
@@ -725,6 +791,7 @@ impl Bot {
             pot: 0, current_bet: 0, min_raise: 10, big_blind: 10,
             dealer_idx: 0, current_open_id: None,
             players: vec![mk(&alice, "Alice", 1000, 0), mk(&bob, "Bob", 1000, 0)],
+            viewer_hole: vec![],
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_lobby2)).await?;
@@ -741,6 +808,7 @@ impl Bot {
             pot: 60, current_bet: 0, min_raise: 10, big_blind: 10,
             dealer_idx: 0, current_open_id: Some(alice.clone()),
             players: vec![mk(&alice, "Alice", 970, 0), mk(&bob, "Bob", 970, 0)],
+            viewer_hole: vec![],
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_lobby_inprog)).await?;
@@ -760,6 +828,7 @@ impl Bot {
                 mk(&alice, "Alice", 995, 5),  // SB
                 mk(&bob, "Bob", 990, 10),     // BB
             ],
+            viewer_hole: vec![],
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_hand_start_card(&snap_start)).await?;
@@ -787,6 +856,9 @@ impl Bot {
                 mk(&alice, "Alice", 970, 0),
                 mk(&bob, "Bob", 950, 20),
             ],
+            // Hole cards for the actor (Alice) so the mock action card shows
+            // the "你的手牌" row.
+            viewer_hole: vec![c(14, Suit::Spades), c(13, Suit::Spades)],
         };
 
         // --------- 8. state - public ---------
@@ -958,6 +1030,10 @@ pub struct GameSnapshot {
     pub dealer_idx: usize,
     pub current_open_id: Option<String>,
     pub players: Vec<PlayerSnapshot>,
+    /// Hole cards of the user this snapshot is being rendered for. Empty
+    /// unless the snapshot is being shown to a specific player (e.g. their
+    /// own action prompt or a `/poker state` reply).
+    pub viewer_hole: Vec<crate::poker::Card>,
 }
 
 #[derive(Debug, Clone)]
@@ -972,6 +1048,16 @@ pub struct PlayerSnapshot {
 }
 
 fn snapshot(g: &Game) -> GameSnapshot {
+    snapshot_for(g, None)
+}
+
+/// Same as `snapshot` but also captures the named viewer's hole cards so
+/// they can be rendered into an ephemeral card meant only for that user.
+fn snapshot_for(g: &Game, viewer_open_id: Option<&str>) -> GameSnapshot {
+    let viewer_hole = viewer_open_id
+        .and_then(|id| g.players.iter().find(|p| p.open_id == id))
+        .map(|p| p.hole.clone())
+        .unwrap_or_default();
     GameSnapshot {
         chat_id: g.chat_id.clone(),
         stage: g.stage,
@@ -996,6 +1082,7 @@ fn snapshot(g: &Game) -> GameSnapshot {
                 sat_out: p.sat_out,
             })
             .collect(),
+        viewer_hole,
     }
 }
 
@@ -1110,8 +1197,8 @@ fn build_lobby_card(snap: &GameSnapshot) -> Value {
                     ""
                 };
                 format!(
-                    "• **{}**{}{} — {} 筹码",
-                    p.name, dealer, status, p.chips
+                    "• {}{}{} — {} 筹码",
+                    at(&p.open_id), dealer, status, p.chips
                 )
             })
             .collect();
@@ -1191,8 +1278,8 @@ fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
             };
             let dealer = if i == snap.dealer_idx { " 🅓" } else { "" };
             format!(
-                "{} **{}**{} — {} 筹码 (本轮 {})",
-                marker, p.name, dealer, p.chips, p.bet_in_round
+                "{} {}{} — {} 筹码 (本轮 {})",
+                marker, at(&p.open_id), dealer, p.chips, p.bet_in_round
             )
         })
         .collect();
@@ -1213,6 +1300,14 @@ fn build_state_card(snap: &GameSnapshot, include_buttons: bool) -> Value {
             let p = &snap.players[p_idx];
             let to_call = snap.current_bet.saturating_sub(p.bet_in_round);
             elements.push(hr());
+
+            // Always re-surface the actor's own hole cards on their action
+            // card so they don't have to scroll up to the original ephemeral.
+            if !snap.viewer_hole.is_empty() {
+                elements.push(markdown("**你的手牌**"));
+                elements.push(cards_row(&snap.viewer_hole));
+            }
+
             elements.push(markdown(&format!(
                 "🎯 **你的回合** · 剩余筹码 **{}** · 需要跟注 **{}**",
                 p.chips, to_call
@@ -1367,11 +1462,11 @@ fn raise_preset_buttons(snap: &GameSnapshot, idx: usize) -> Vec<Value> {
 /// One-shot public card posted at the start of a hand so non-actors immediately
 /// know the hand began, who's in, and who's first to act.
 fn build_hand_start_card(snap: &GameSnapshot) -> Value {
-    let dealer = snap
+    let dealer_at = snap
         .players
         .get(snap.dealer_idx)
-        .map(|p| p.name.as_str())
-        .unwrap_or("?");
+        .map(|p| at(&p.open_id))
+        .unwrap_or_else(|| "?".to_string());
     // Players who actually posted blinds this hand are exactly the ones whose
     // bet_in_round is positive — derive the names from that, so we don't have
     // to recompute heads-up vs multi-way blind positions here.
@@ -1379,16 +1474,14 @@ fn build_hand_start_card(snap: &GameSnapshot) -> Value {
         .players
         .iter()
         .filter(|p| p.bet_in_round > 0)
-        .map(|p| format!("{} **{}** ({})", at(&p.open_id), p.name, p.bet_in_round))
+        .map(|p| format!("{} ({})", at(&p.open_id), p.bet_in_round))
         .collect();
-    let mut body = format!("庄家 **{}**", dealer);
+    let mut body = format!("庄家 {}", dealer_at);
     if !blind_posters.is_empty() {
         body.push_str(&format!("\n盲注：{}", blind_posters.join(" · ")));
     }
     if let Some(actor_id) = &snap.current_open_id {
-        if let Some(p) = snap.players.iter().find(|p| &p.open_id == actor_id) {
-            body.push_str(&format!("\n↓ 首位 {} **{}**", at(actor_id), p.name));
-        }
+        body.push_str(&format!("\n↓ 首位 {}", at(actor_id)));
     }
     card(
         header_with_subtitle(
@@ -1428,9 +1521,8 @@ fn build_action_announcement(snap: &GameSnapshot, log: &ActionLogEntry) -> Value
     }
 
     let mut body = format!(
-        "{} **{}** {} (筹码 {})",
+        "{} {} (筹码 {})",
         at(&p.open_id),
-        p.name,
         action,
         p.chips
     );
@@ -1442,13 +1534,7 @@ fn build_action_announcement(snap: &GameSnapshot, log: &ActionLogEntry) -> Value
     if in_progress {
         if let Some(actor_id) = &snap.current_open_id {
             if actor_id != &p.open_id {
-                if let Some(next) = snap.players.iter().find(|np| &np.open_id == actor_id) {
-                    body.push_str(&format!(
-                        "\n↓ 下一位 {} **{}**",
-                        at(actor_id),
-                        next.name
-                    ));
-                }
+                body.push_str(&format!("\n↓ 下一位 {}", at(actor_id)));
             }
         }
     }
