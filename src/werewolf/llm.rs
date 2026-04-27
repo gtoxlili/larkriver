@@ -150,9 +150,10 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
 fn persona_line(persona: Option<Persona>) -> String {
     match persona {
         Some(p) => format!(
-            "你的性格：**{}** —— {}\n按你性格的方式说话和决策，不要太教科书。",
+            "你的性格：**{}** —— {}\n按你性格说话 / 投票 / 站边，不要太教科书。",
             p.label(),
-            p.description()
+            // 用狼人杀专属的人设描述，而不是德州的下注风格
+            p.werewolf_description()
         ),
         None => "性格随性，按一般直觉决策。".into(),
     }

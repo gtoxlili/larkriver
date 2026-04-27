@@ -46,6 +46,28 @@ impl Persona {
         }
     }
 
+    /// 同一种人设在狼人杀里的发言 / 投票风格。
+    /// 德州的"松凶 / 紧凶 / 跟注站 / 紧弱 / 疯狂"映射到狼人杀的对应表现。
+    pub fn werewolf_description(self) -> &'static str {
+        match self {
+            Persona::LooseAggressive =>
+                "嘴快型。第一个开口攻击别人，敢站警 / 敢悍跳预言家 / 敢拍人。\
+                 信息少也敢下定论，错了也不怕，气势压人。",
+            Persona::TightAggressive =>
+                "稳准狠型。话不多但每句都带信息，逻辑清晰。看准了才开火，开火必中要害。\
+                 不轻易站边但站了就咬死。",
+            Persona::LooseWeak =>
+                "墙头草型。不主动挑事，跟着大流走。别人投谁就投谁，容易被节奏带。\
+                 发言软、含糊、和稀泥。",
+            Persona::TightWeak =>
+                "闷罐型。话特别少，等别人挂底牌再表态。投票永远跟大流，绝不出头，\
+                 也绝不冲在最前。被问到才说，回答简短。",
+            Persona::Maniac =>
+                "头铁型。第一天就跳预言家 / 抢警 / 乱站人，不需要证据。\
+                 死了也要拉一个垫背，永远凶，永远情绪化。",
+        }
+    }
+
     /// Single emoji that represents the persona visually — used as the "avatar"
     /// in chat-bubble cards so each AI has a recognisable face beyond just the
     /// name suffix.
