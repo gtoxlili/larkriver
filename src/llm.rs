@@ -2,7 +2,7 @@
 //! against any OpenAI-compatible endpoint (OpenAI, DeepSeek, Doubao /
 //! 火山引擎, OpenRouter, vLLM, …) by overriding the API base.
 
-use crate::game::PlayerAction;
+use crate::game::{Persona, PlayerAction};
 use crate::poker::{Card, DeckMode};
 use anyhow::{anyhow, Context, Result};
 use async_openai::{
@@ -39,6 +39,8 @@ pub struct DecisionContext {
     pub hole: Vec<Card>,
     pub community: Vec<Card>,
     pub equity: Option<f64>,
+    /// Persona archetype shaping decision style.
+    pub persona: Option<Persona>,
     /// One line per other player: name / stack / status / bet this round.
     pub others: Vec<String>,
     /// Recent action log lines for this hand.
@@ -77,12 +79,13 @@ impl LlmClient {
     }
 
     async fn try_decide(&self, ctx: &DecisionContext) -> Result<PlayerAction> {
+        let system = system_prompt(ctx.persona);
         let prompt = build_prompt(ctx);
         let req = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages([
                 ChatCompletionRequestSystemMessageArgs::default()
-                    .content(SYSTEM_PROMPT)
+                    .content(system)
                     .build()?
                     .into(),
                 ChatCompletionRequestUserMessageArgs::default()
@@ -113,7 +116,22 @@ impl LlmClient {
     }
 }
 
-const SYSTEM_PROMPT: &str = r#"你是德州扑克 AI 玩家。仅返回单个有效 JSON 对象，不要任何其他文字、不要 markdown、不要代码块包装。
+/// Build the system prompt, injecting the persona archetype when set so the
+/// AI plays a distinguishable style instead of a vanilla "GTO-ish" line.
+fn system_prompt(persona: Option<Persona>) -> String {
+    let persona_block = match persona {
+        Some(p) => format!(
+            "\n\n## 你的风格 — {}\n{}\n按这个风格做决策。可以偶尔反向出牌避免被读穿，\
+             但整体行为应该明显偏向你的风格。",
+            p.label(),
+            p.description()
+        ),
+        None => String::new(),
+    };
+    format!("{BASE_SYSTEM_PROMPT}{persona_block}")
+}
+
+const BASE_SYSTEM_PROMPT: &str = r#"你是德州扑克 AI 玩家。仅返回单个有效 JSON 对象，不要任何其他文字、不要 markdown、不要代码块包装。
 
 ## 返回 JSON 结构
 

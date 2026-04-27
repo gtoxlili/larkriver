@@ -1,6 +1,62 @@
 use crate::poker::{best_five, category_name, Card, Deck, DeckMode, HandRank};
 use anyhow::{anyhow, Result};
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+
+/// Personality archetype for an AI seat. Drives the LLM system prompt so the
+/// bot doesn't always play the same boring "GTO-ish" line — gives the table
+/// some flavor for casual play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Persona {
+    /// 松凶 / LAG — plays many hands, aggressive, lots of c-bets and bluffs.
+    LooseAggressive,
+    /// 紧凶 / TAG — narrow range but bets/raises hard when in.
+    TightAggressive,
+    /// 鱼 / 松弱 — calls too much, almost never raises, can't fold.
+    LooseWeak,
+    /// 岩石 / 紧弱 — only plays premium hands, never bluffs.
+    TightWeak,
+    /// 疯狂 / Maniac — raises and re-raises constantly, hates folding.
+    Maniac,
+}
+
+impl Persona {
+    pub fn label(self) -> &'static str {
+        match self {
+            Persona::LooseAggressive => "松凶",
+            Persona::TightAggressive => "紧凶",
+            Persona::LooseWeak => "鱼",
+            Persona::TightWeak => "岩石",
+            Persona::Maniac => "疯狂",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Persona::LooseAggressive =>
+                "玩很多手牌、敢开火、敢加注、敢诈唬。常用边缘手和持续下注 (c-bet) 给对手施压，能弃牌但不轻易弃。",
+            Persona::TightAggressive =>
+                "牌池窄、出手猛。差牌坚决弃，进入底池后用价值下注 / 加注主动塑造底池，避免被动。",
+            Persona::LooseWeak =>
+                "喜欢看牌跟到底，舍不得弃。很少主动加注。除非被反复打到否则一路跟。",
+            Persona::TightWeak =>
+                "极度保守。只在拿到 QQ+ / AK / 同花连张这类强牌时进入底池，没成对就弃，从不诈唬。",
+            Persona::Maniac =>
+                "几乎每手都要加注或再加注，喜欢诈唬和半诈唬，希望用激进的下注节奏把对手赶出底池。很难弃牌。",
+        }
+    }
+
+    pub fn random() -> Self {
+        let all = [
+            Persona::LooseAggressive,
+            Persona::TightAggressive,
+            Persona::LooseWeak,
+            Persona::TightWeak,
+            Persona::Maniac,
+        ];
+        *all.choose(&mut rand::thread_rng()).unwrap()
+    }
+}
 
 /// Default chip stack each player starts with.
 pub const STARTING_CHIPS: u64 = 1000;
@@ -25,6 +81,10 @@ pub struct Player {
     /// won't resolve in Feishu — display code substitutes the name instead of
     /// rendering an `<at>` tag.
     pub is_ai: bool,
+    /// Personality archetype for AI seats; `None` for humans. Drives the
+    /// system prompt so different AIs play different styles.
+    #[serde(default)]
+    pub persona: Option<Persona>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,17 +217,28 @@ impl Game {
     }
 
     pub fn add_player(&mut self, open_id: String, name: String) -> Result<()> {
-        self.add_player_inner(open_id, name, false)
+        self.add_player_inner(open_id, name, false, None)
     }
 
-    /// Like `add_player` but flags the seat as LLM-driven. Synthetic open_id
-    /// (`ai:...`) — won't resolve in Feishu, but used to look the seat up
-    /// internally.
-    pub fn add_ai_player(&mut self, open_id: String, name: String) -> Result<()> {
-        self.add_player_inner(open_id, name, true)
+    /// Like `add_player` but flags the seat as LLM-driven and tags it with a
+    /// persona. Synthetic open_id (`ai:...`) — won't resolve in Feishu, but
+    /// used to look the seat up internally.
+    pub fn add_ai_player(
+        &mut self,
+        open_id: String,
+        name: String,
+        persona: Persona,
+    ) -> Result<()> {
+        self.add_player_inner(open_id, name, true, Some(persona))
     }
 
-    fn add_player_inner(&mut self, open_id: String, name: String, is_ai: bool) -> Result<()> {
+    fn add_player_inner(
+        &mut self,
+        open_id: String,
+        name: String,
+        is_ai: bool,
+        persona: Option<Persona>,
+    ) -> Result<()> {
         if !matches!(self.stage, Stage::Lobby | Stage::Ended) {
             return Err(anyhow!("一局牌正在进行中，等结束后再加入"));
         }
@@ -189,6 +260,7 @@ impl Game {
             acted_this_round: false,
             sat_out: false,
             is_ai,
+            persona,
         });
         Ok(())
     }

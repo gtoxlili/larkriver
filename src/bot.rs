@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::feishu::cards::*;
 use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
-use crate::game::*;
+use crate::game::{*, Persona};
 use crate::llm::{DecisionContext, LlmClient};
 use crate::poker::{category_name, DeckMode};
 use crate::storage::Store;
@@ -287,9 +287,10 @@ impl Bot {
                 .or_insert_with(|| Game::new(chat_id.to_string()));
             // Number new AI seats sequentially per table.
             let n = game.players.iter().filter(|p| p.is_ai).count() + 1;
+            let persona = Persona::random();
             let ai_id = format!("ai:{}", n);
-            let ai_name = format!("AI #{}", n);
-            game.add_ai_player(ai_id, ai_name)?;
+            let ai_name = format!("{} #{}", persona.label(), n);
+            game.add_ai_player(ai_id, ai_name, persona)?;
             self.persist_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
@@ -863,6 +864,7 @@ impl Bot {
                 hole: p.hole.clone(),
                 community: g.community.clone(),
                 equity: None,
+                persona: p.persona,
                 others,
                 history,
             };
@@ -1521,11 +1523,12 @@ fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
     if snap.players.is_empty() {
         elements.push(markdown("🪑 牌桌空空如也，点击下方 **加入** 就座。"));
     } else {
-        // Avatar row for joined players.
+        // Avatar row for joined HUMANS only — AI seats have synthetic open_ids
+        // that Feishu's person_list resolves to "未知用户".
         let active_ids: Vec<String> = snap
             .players
             .iter()
-            .filter(|p| !p.sat_out)
+            .filter(|p| !p.sat_out && !p.is_ai)
             .map(|p| p.open_id.clone())
             .collect();
         if !active_ids.is_empty() {
