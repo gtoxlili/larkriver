@@ -78,9 +78,15 @@ docker run -d \
 | `reset` / `重置` | 重置牌桌 |
 | `help` / `帮助` | 帮助卡 |
 
-也可以点持久化大厅卡上的 `[加入]` `[离开]` `[开局]` `[短牌]` 按钮。`[短牌]` 走 6+ Hold'em：36 张牌（去掉 2-5），同花 > 葫芦、三条 > 顺子，A 低顺是 A-6-7-8-9。`/poker start short` 是文字版等价命令。
+也可以点持久化大厅卡上的 `[加入]` `[加入 AI]` `[离开]` `[开局]` `[短牌]` 按钮。`[短牌]` 走 6+ Hold'em：36 张牌（去掉 2-5），同花 > 葫芦、三条 > 顺子，A 低顺是 A-6-7-8-9。`/poker start short` 是文字版等价命令。
 
 行动按钮只发给当前 actor，仅他可见，包括 `[弃牌] [跟注 X] [全押]` 一行 + 加注 form 输入框 + 三个加注预设。
+
+## AI 对手
+
+设置了 `OPENAI_API_KEY` 后，大厅多一个 `[加入 AI]` 按钮，点一次加一个 LLM 驱动的 AI 玩家（可加多个）。AI 轮到时机器人会带着公共牌、手牌、底池、equity、历史动作请 LLM 给出 fold/check/call/raise/allin 决策，模型用 `response_format=json_object` 返回结构化 JSON。LLM 失败/超时自动 fallback 到 check 或 fold。
+
+兼容任何 OpenAI 风格端点（DeepSeek / 豆包 / OpenAI / OpenRouter / vLLM 等）。`.env.example` 里有几个端点的配置示例。
 
 ## 注意事项
 

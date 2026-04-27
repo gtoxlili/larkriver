@@ -2,6 +2,7 @@ mod bot;
 mod config;
 mod feishu;
 mod game;
+mod llm;
 mod poker;
 mod server;
 

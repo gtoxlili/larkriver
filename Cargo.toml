@@ -17,6 +17,7 @@ anyhow = "1"
 parking_lot = "0.12"
 itertools = "0.13"
 uuid = { version = "1", features = ["v4"] }
+async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

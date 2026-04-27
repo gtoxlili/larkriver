@@ -20,6 +20,10 @@ pub struct Player {
     pub all_in: bool,
     pub acted_this_round: bool,
     pub sat_out: bool, // out of chips, skipped this hand
+    /// LLM-driven seat. `open_id` is a synthetic id like `ai:doubao:1` that
+    /// won't resolve in Feishu — display code substitutes the name instead of
+    /// rendering an `<at>` tag.
+    pub is_ai: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +155,17 @@ impl Game {
     }
 
     pub fn add_player(&mut self, open_id: String, name: String) -> Result<()> {
+        self.add_player_inner(open_id, name, false)
+    }
+
+    /// Like `add_player` but flags the seat as LLM-driven. Synthetic open_id
+    /// (`ai:...`) — won't resolve in Feishu, but used to look the seat up
+    /// internally.
+    pub fn add_ai_player(&mut self, open_id: String, name: String) -> Result<()> {
+        self.add_player_inner(open_id, name, true)
+    }
+
+    fn add_player_inner(&mut self, open_id: String, name: String, is_ai: bool) -> Result<()> {
         if !matches!(self.stage, Stage::Lobby | Stage::Ended) {
             return Err(anyhow!("一局牌正在进行中，等结束后再加入"));
         }
@@ -171,6 +186,7 @@ impl Game {
             all_in: false,
             acted_this_round: false,
             sat_out: false,
+            is_ai,
         });
         Ok(())
     }

@@ -7,6 +7,11 @@ pub struct Config {
     pub bind_addr: String,
     pub allowed_chat_id: Option<String>,
     pub verification_token: Option<String>,
+    /// LLM credentials for the AI opponent. `OPENAI_API_KEY` is the toggle —
+    /// when unset, the [加入 AI] button is hidden and AI seats refuse to act.
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: String,
+    pub openai_model: String,
 }
 
 impl Config {
@@ -18,6 +23,11 @@ impl Config {
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
             allowed_chat_id: env_opt("ALLOWED_CHAT_ID"),
             verification_token: env_opt("FEISHU_VERIFICATION_TOKEN"),
+            openai_api_key: env_opt("OPENAI_API_KEY"),
+            openai_base_url: env_opt("OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+            openai_model: env_opt("OPENAI_MODEL")
+                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
         })
     }
 }

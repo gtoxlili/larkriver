@@ -3,6 +3,7 @@ use crate::feishu::cards::*;
 use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
 use crate::game::*;
+use crate::llm::{DecisionContext, LlmClient};
 use crate::poker::{category_name, DeckMode};
 
 use anyhow::{anyhow, Result};
@@ -27,6 +28,8 @@ pub struct Bot {
     /// Short window (a few seconds) so legitimate re-clicks later are still
     /// processed.
     seen_actions: Mutex<HashMap<String, Instant>>,
+    /// LLM client. `None` when `OPENAI_API_KEY` is unset → AI features hide.
+    llm: Option<LlmClient>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,12 @@ enum Command {
 
 impl Bot {
     pub fn new(client: Arc<FeishuClient>, cfg: Config) -> Arc<Self> {
+        let llm = cfg.openai_api_key.clone().map(|key| {
+            LlmClient::new(key, cfg.openai_base_url.clone(), cfg.openai_model.clone())
+        });
+        if llm.is_some() {
+            info!(model = %cfg.openai_model, "LLM AI seat enabled");
+        }
         Arc::new(Self {
             client,
             cfg,
@@ -49,6 +58,7 @@ impl Bot {
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(HashMap::new()),
             seen_actions: Mutex::new(HashMap::new()),
+            llm,
         })
     }
 
@@ -220,6 +230,24 @@ impl Bot {
         self.refresh_lobby(chat_id).await
     }
 
+    async fn do_join_ai(&self, chat_id: &str) -> Result<()> {
+        if self.llm.is_none() {
+            return Err(anyhow!("机器人未配置 LLM (OPENAI_API_KEY 缺失)，无法加入 AI"));
+        }
+        {
+            let mut games = self.games.lock();
+            let game = games
+                .entry(chat_id.to_string())
+                .or_insert_with(|| Game::new(chat_id.to_string()));
+            // Number new AI seats sequentially per table.
+            let n = game.players.iter().filter(|p| p.is_ai).count() + 1;
+            let ai_id = format!("ai:doubao:{}", n);
+            let ai_name = format!("豆包 #{}", n);
+            game.add_ai_player(ai_id, ai_name)?;
+        }
+        self.refresh_lobby(chat_id).await
+    }
+
     async fn do_leave(&self, chat_id: &str, open_id: &str) -> Result<()> {
         {
             let mut games = self.games.lock();
@@ -255,7 +283,7 @@ impl Bot {
             let games = self.games.lock();
             let Some(game) = games.get(chat_id) else { return Ok(()); };
             let snap = snapshot(game);
-            (build_lobby_card(&snap), game.lobby_msg_id.clone())
+            (build_lobby_card(&snap, self.llm.is_some()), game.lobby_msg_id.clone())
         };
 
         if let Some(msg_id) = existing_msg_id {
@@ -285,7 +313,19 @@ impl Bot {
             }
             game.players
                 .iter()
-                .map(|p| format!("• {} — **{}** 筹码", at(&p.open_id), p.chips))
+                .map(|p| {
+                    let snap_p = PlayerSnapshot {
+                        open_id: p.open_id.clone(),
+                        name: p.name.clone(),
+                        chips: p.chips,
+                        bet_in_round: p.bet_in_round,
+                        folded: p.folded,
+                        all_in: p.all_in,
+                        sat_out: p.sat_out,
+                        is_ai: p.is_ai,
+                    };
+                    format!("• {} — **{}** 筹码", display_name(&snap_p), p.chips)
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -334,10 +374,12 @@ impl Bot {
                 .ok_or_else(|| anyhow!("当前没有牌局, 先 join"))?;
             game.start_hand(mode)?;
             let snap = snapshot(game);
+            // Only humans get ephemeral hole-card messages — AI seats have
+            // synthetic open_ids that Feishu would reject.
             let hole: Vec<(String, String, Vec<crate::poker::Card>)> = game
                 .players
                 .iter()
-                .filter(|p| !p.sat_out)
+                .filter(|p| !p.sat_out && !p.is_ai)
                 .map(|p| (p.open_id.clone(), p.name.clone(), p.hole.clone()))
                 .collect();
             (snap, hole)
@@ -381,8 +423,9 @@ impl Bot {
             )
             .await;
 
-        // Ephemeral state+buttons sent only to the first actor.
-        self.post_actor_prompt(chat_id).await?;
+        // Drive forward — first actor will get an ephemeral, or if it's an
+        // AI seat we advance through it (and any consecutive AIs) right away.
+        self.advance_actor(chat_id).await;
         Ok(())
     }
 
@@ -436,7 +479,11 @@ impl Bot {
         // return immediately so the webhook responds inside Feishu's timeout.
         if matches!(
             action_id.as_str(),
-            "join_lobby" | "leave_lobby" | "start_lobby" | "start_lobby_short"
+            "join_lobby"
+                | "leave_lobby"
+                | "start_lobby"
+                | "start_lobby_short"
+                | "join_ai_lobby"
         ) {
             let bot = self.clone();
             let aid = action_id.clone();
@@ -455,6 +502,7 @@ impl Bot {
                     "leave_lobby" => bot.do_leave(&cid, &oid).await,
                     "start_lobby" => bot.do_start(&cid, DeckMode::Standard).await,
                     "start_lobby_short" => bot.do_start(&cid, DeckMode::ShortDeck).await,
+                    "join_ai_lobby" => bot.do_join_ai(&cid).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = res {
@@ -575,28 +623,42 @@ impl Bot {
     }
 
     async fn post_action_outcome(&self, chat_id: &str, snap: GameSnapshot, outcome: ActOutcome) {
-        // Public announcement: who did what + post-action state + next actor.
-        // Carries enough info that non-actors can follow without seeing the
-        // ephemeral state card.
+        let hand_ended = outcome.summary.is_some();
+        self.publish_action_messages(chat_id, &snap, &outcome).await;
+        if hand_ended {
+            return;
+        }
+        self.advance_actor(chat_id).await;
+    }
+
+    /// Just the messaging side of `post_action_outcome` — public action card,
+    /// stage cards, summary on hand end. Doesn't touch actor scheduling so it
+    /// can be reused inside `advance_actor` after each AI move.
+    async fn publish_action_messages(
+        &self,
+        chat_id: &str,
+        snap: &GameSnapshot,
+        outcome: &ActOutcome,
+    ) {
         let _ = self
             .client
             .send_message(
                 "chat_id",
                 chat_id,
                 "interactive",
-                &build_action_announcement(&snap, &outcome.log),
+                &build_action_announcement(snap, &outcome.log),
             )
             .await;
 
         if let Some((stage, cards)) = &outcome.stage_cards {
-            let _ = self.post_stage_card(chat_id, *stage, cards, &snap).await;
+            let _ = self.post_stage_card(chat_id, *stage, cards, snap).await;
         }
         for (stage, cards) in &outcome.extra_stages {
-            let _ = self.post_stage_card(chat_id, *stage, cards, &snap).await;
+            let _ = self.post_stage_card(chat_id, *stage, cards, snap).await;
         }
 
-        if let Some(summary) = outcome.summary {
-            let _ = self.post_summary(chat_id, &snap, &summary).await;
+        if let Some(summary) = &outcome.summary {
+            let _ = self.post_summary(chat_id, snap, summary).await;
             // Hand ended. The previous lobby card is now buried under action /
             // stage / summary cards, so drop its id and post a fresh one so the
             // next-hand buttons are visible at the bottom of the chat.
@@ -604,10 +666,159 @@ impl Bot {
                 g.lobby_msg_id = None;
             }
             let _ = self.refresh_lobby(chat_id).await;
-        } else if outcome.next_actor_open_id.is_some() {
-            // Buttons go only to the player whose turn it is.
-            let _ = self.post_actor_prompt(chat_id).await;
         }
+    }
+
+    /// Walk forward through any consecutive AI seats. The loop terminates as
+    /// soon as we hit a human (we post their ephemeral action card and wait
+    /// for their button click) or the hand ends.
+    async fn advance_actor(&self, chat_id: &str) {
+        loop {
+            let actor_info = {
+                let games = self.games.lock();
+                let Some(g) = games.get(chat_id) else { return; };
+                if !matches!(
+                    g.stage,
+                    Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
+                ) {
+                    return;
+                }
+                g.players
+                    .get(g.current_idx)
+                    .map(|p| (p.open_id.clone(), p.is_ai))
+            };
+            let Some((actor_id, is_ai)) = actor_info else { return; };
+
+            if !is_ai {
+                let _ = self.post_actor_prompt(chat_id).await;
+                return;
+            }
+
+            // AI seat — pause briefly so the chat doesn't feel robotic, then
+            // ask the LLM and apply the action.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let action = self.ai_decide(chat_id, &actor_id).await;
+            let result = {
+                let mut games = self.games.lock();
+                let Some(g) = games.get_mut(chat_id) else { return; };
+                g.act(&actor_id, action).map(|outcome| (outcome, snapshot(g)))
+            };
+            match result {
+                Ok((outcome, snap)) => {
+                    let hand_ended = outcome.summary.is_some();
+                    self.publish_action_messages(chat_id, &snap, &outcome).await;
+                    if hand_ended {
+                        return;
+                    }
+                    // continue loop — possibly another AI is up next
+                }
+                Err(e) => {
+                    warn!(?e, ai = %actor_id, "AI action rejected, bailing");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Build the LLM context (with a fresh equity Monte Carlo) and ask the
+    /// model. With no LLM configured, plays a safe default (check or fold).
+    async fn ai_decide(&self, chat_id: &str, ai_id: &str) -> PlayerAction {
+        let Some(ctx) = self.build_ai_context(chat_id, ai_id) else {
+            return PlayerAction::Fold;
+        };
+        match &self.llm {
+            Some(llm) => llm.decide(&ctx).await,
+            None => {
+                if ctx.to_call == 0 {
+                    PlayerAction::Check
+                } else {
+                    PlayerAction::Fold
+                }
+            }
+        }
+    }
+
+    fn build_ai_context(&self, chat_id: &str, ai_id: &str) -> Option<DecisionContext> {
+        let (mut ctx, n_opp) = {
+            let games = self.games.lock();
+            let g = games.get(chat_id)?;
+            let p_idx = g.players.iter().position(|p| p.open_id == ai_id)?;
+            let p = &g.players[p_idx];
+            let n_opp = g
+                .players
+                .iter()
+                .filter(|op| !op.folded && !op.sat_out && op.open_id != ai_id)
+                .count();
+            let others = g
+                .players
+                .iter()
+                .filter(|op| op.open_id != ai_id)
+                .map(|op| {
+                    let status = if op.folded {
+                        "弃牌"
+                    } else if op.all_in {
+                        "全押"
+                    } else if op.sat_out {
+                        "出局"
+                    } else {
+                        "活跃"
+                    };
+                    format!(
+                        "{}: 筹码 {}, 本轮 {}, 状态 {}",
+                        op.name, op.chips, op.bet_in_round, status
+                    )
+                })
+                .collect::<Vec<_>>();
+            let history = g
+                .action_log
+                .iter()
+                .map(|log| {
+                    let actor = &g.players[log.player_idx];
+                    let label = match log.kind {
+                        ActionKind::Fold => "弃牌".to_string(),
+                        ActionKind::Check => "过牌".to_string(),
+                        ActionKind::Call => format!("跟注到 {}", log.amount),
+                        ActionKind::Bet => format!("下注 {}", log.amount),
+                        ActionKind::Raise => format!("加注到 {}", log.amount),
+                        ActionKind::AllIn => format!("全押 {}", log.amount),
+                    };
+                    format!("{}: {}", actor.name, label)
+                })
+                .collect::<Vec<_>>();
+            let ctx = DecisionContext {
+                mode: g.mode,
+                stage: g.stage.label().to_string(),
+                hand_count: g.hand_count,
+                pot: g.pot_total(),
+                current_bet: g.current_bet,
+                min_raise: g.min_raise,
+                big_blind: g.big_blind,
+                my_name: p.name.clone(),
+                my_stack: p.chips,
+                my_bet_in_round: p.bet_in_round,
+                to_call: g.current_bet.saturating_sub(p.bet_in_round),
+                my_max_to: p.chips + p.bet_in_round,
+                min_raise_to: (g.current_bet + g.min_raise).max(g.big_blind),
+                hole: p.hole.clone(),
+                community: g.community.clone(),
+                equity: None,
+                others,
+                history,
+            };
+            (ctx, n_opp)
+        };
+
+        // Equity is the slow part — compute outside the lock.
+        if !ctx.hole.is_empty() && n_opp > 0 {
+            ctx.equity = Some(crate::poker::equity(
+                &ctx.hole,
+                &ctx.community,
+                n_opp,
+                2000,
+                ctx.mode,
+            ));
+        }
+        Some(ctx)
     }
 
     /// Send the action card (full state + buttons) only to the player whose
@@ -695,7 +906,7 @@ impl Bot {
                 let p = &snap.players[s.player_idx];
                 elements.push(markdown(&format!(
                     "{} · {}",
-                    at(&p.open_id),
+                    display_name(p),
                     category_name(s.rank.category, snap.mode)
                 )));
                 elements.push(markdown("手牌"));
@@ -715,7 +926,7 @@ impl Bot {
             let winner_names = payout
                 .winners
                 .iter()
-                .map(|i| at(&snap.players[*i].open_id))
+                .map(|i| display_name(&snap.players[*i]))
                 .collect::<Vec<_>>()
                 .join("、");
             let line = if payout.winners.is_empty() {
@@ -732,7 +943,7 @@ impl Bot {
         let chips_line = snap
             .players
             .iter()
-            .map(|p| format!("{}: {}", at(&p.open_id), p.chips))
+            .map(|p| format!("{}: {}", display_name(p), p.chips))
             .collect::<Vec<_>>()
             .join(" · ");
         elements.push(note(&format!(
@@ -788,6 +999,7 @@ impl Bot {
             folded: false,
             all_in: false,
             sat_out: false,
+            is_ai: false,
         };
         let c = |r: u8, s: Suit| Card { rank: Rank(r), suit: s };
 
@@ -839,7 +1051,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_empty)).await?;
+            &build_lobby_card(&snap_empty, true)).await?;
 
         // --------- 4. lobby with 2 waiting ---------
         let n = step("lobby waiting");
@@ -857,7 +1069,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby2)).await?;
+            &build_lobby_card(&snap_lobby2, true)).await?;
 
         // --------- 5. lobby in-progress ---------
         let n = step("lobby in-progress");
@@ -875,7 +1087,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby_inprog)).await?;
+            &build_lobby_card(&snap_lobby_inprog, true)).await?;
 
         // --------- 6. hand start ---------
         let n = step("hand start");
@@ -1115,6 +1327,17 @@ pub struct PlayerSnapshot {
     pub folded: bool,
     pub all_in: bool,
     pub sat_out: bool,
+    pub is_ai: bool,
+}
+
+/// Render a player's name as either a Feishu @-mention (humans) or a styled
+/// plain name (AI seats — synthetic open_ids would fail the at-id validator).
+pub fn display_name(p: &PlayerSnapshot) -> String {
+    if p.is_ai {
+        format!("🤖 **{}**", p.name)
+    } else {
+        at(&p.open_id)
+    }
 }
 
 fn snapshot(g: &Game) -> GameSnapshot {
@@ -1150,6 +1373,7 @@ fn snapshot_for(g: &Game, viewer_open_id: Option<&str>) -> GameSnapshot {
                 folded: p.folded,
                 all_in: p.all_in,
                 sat_out: p.sat_out,
+                is_ai: p.is_ai,
             })
             .collect(),
         viewer_hole,
@@ -1217,7 +1441,7 @@ fn build_welcome_card(chat_id: &str, name: &str) -> Value {
 /// The persistent "lobby" card: a single message in the chat that's updated in
 /// place as players join/leave, and that flips to a "in-progress" view (with no
 /// buttons) for the duration of a hand.
-fn build_lobby_card(snap: &GameSnapshot) -> Value {
+fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
     let in_progress = matches!(
         snap.stage,
         Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River | Stage::Showdown
@@ -1269,7 +1493,7 @@ fn build_lobby_card(snap: &GameSnapshot) -> Value {
                 };
                 format!(
                     "• {}{}{} — {} 筹码",
-                    at(&p.open_id), dealer, status, p.chips
+                    display_name(p), dealer, status, p.chips
                 )
             })
             .collect();
@@ -1283,6 +1507,13 @@ fn build_lobby_card(snap: &GameSnapshot) -> Value {
             merge(&v_base, &json!({ "action": "join_lobby" })),
             "primary",
         )];
+        if ai_enabled {
+            buttons.push(button(
+                "加入 AI",
+                merge(&v_base, &json!({ "action": "join_ai_lobby" })),
+                "default",
+            ));
+        }
         if !snap.players.is_empty() {
             buttons.push(button(
                 "离开",
@@ -1395,7 +1626,7 @@ fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_bu
             let dealer = if i == snap.dealer_idx { " 🅓" } else { "" };
             format!(
                 "{} {}{} — {} 筹码 (本轮 {})",
-                marker, at(&p.open_id), dealer, p.chips, p.bet_in_round
+                marker, display_name(p), dealer, p.chips, p.bet_in_round
             )
         })
         .collect();
@@ -1461,7 +1692,9 @@ fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_bu
             }
         }
         if let Some(open_id) = actor {
-            elements.push(note(&format!("{} 行动中…", at(open_id))));
+            if let Some(p) = snap.players.iter().find(|p| p.open_id == open_id) {
+                elements.push(note(&format!("{} 行动中…", display_name(p))));
+            }
         }
     } else {
         elements.push(note("等待发牌或本局已结束。"));
@@ -1614,7 +1847,7 @@ fn build_hand_start_card(snap: &GameSnapshot) -> Value {
     let dealer_at = snap
         .players
         .get(snap.dealer_idx)
-        .map(|p| at(&p.open_id))
+        .map(display_name)
         .unwrap_or_else(|| "?".to_string());
     // Players who actually posted blinds this hand are exactly the ones whose
     // bet_in_round is positive — derive the names from that, so we don't have
@@ -1623,14 +1856,16 @@ fn build_hand_start_card(snap: &GameSnapshot) -> Value {
         .players
         .iter()
         .filter(|p| p.bet_in_round > 0)
-        .map(|p| format!("{} ({})", at(&p.open_id), p.bet_in_round))
+        .map(|p| format!("{} ({})", display_name(p), p.bet_in_round))
         .collect();
     let mut body = format!("庄家 {}", dealer_at);
     if !blind_posters.is_empty() {
         body.push_str(&format!("\n盲注：{}", blind_posters.join(" · ")));
     }
     if let Some(actor_id) = &snap.current_open_id {
-        body.push_str(&format!("\n↓ 首位 {}", at(actor_id)));
+        if let Some(p) = snap.players.iter().find(|p| &p.open_id == actor_id) {
+            body.push_str(&format!("\n↓ 首位 {}", display_name(p)));
+        }
     }
     let title = match snap.mode {
         DeckMode::Standard => format!("🂠 第 {} 局开始", snap.hand_count),
@@ -1675,7 +1910,7 @@ fn build_action_announcement(snap: &GameSnapshot, log: &ActionLogEntry) -> Value
 
     let mut body = format!(
         "{} {} (筹码 {})",
-        at(&p.open_id),
+        display_name(p),
         action,
         p.chips
     );
@@ -1687,7 +1922,9 @@ fn build_action_announcement(snap: &GameSnapshot, log: &ActionLogEntry) -> Value
     if in_progress {
         if let Some(actor_id) = &snap.current_open_id {
             if actor_id != &p.open_id {
-                body.push_str(&format!("\n↓ 下一位 {}", at(actor_id)));
+                if let Some(np) = snap.players.iter().find(|np| &np.open_id == actor_id) {
+                    body.push_str(&format!("\n↓ 下一位 {}", display_name(np)));
+                }
             }
         }
     }
