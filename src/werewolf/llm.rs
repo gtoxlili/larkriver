@@ -31,12 +31,15 @@ pub struct PublicView<'a> {
     pub persona: Option<Persona>,
     /// (idx, name, alive)
     pub players: Vec<(usize, String, bool)>,
-    /// 夜里队友信息（仅狼可见）：(idx, name)
-    pub teammates: Vec<(usize, String)>,
+    /// 夜里队友信息（仅狼可见，含狼王）：(idx, name, role_label)
+    pub teammates: Vec<(usize, String, &'static str)>,
     /// 预言家自己的查验历史：(day, target_name, is_wolf)
     pub seer_log: Vec<(u32, String, bool)>,
     /// 公开事件日志（死讯 / 放逐 / quip 等）。
     pub event_log: &'a [String],
+    /// **本玩家自己**的所有公开发言（按时间顺序），从 recap_log 提取。
+    /// 给后续决策提供"我说过什么"的强信号——避免发言和实际行动冲突。
+    pub my_statements: Vec<String>,
 }
 
 impl<'a> PublicView<'a> {
@@ -65,7 +68,11 @@ impl<'a> PublicView<'a> {
             players_str.join(" · ")
         );
         if !self.teammates.is_empty() {
-            let names: Vec<String> = self.teammates.iter().map(|(_, n)| n.clone()).collect();
+            let names: Vec<String> = self
+                .teammates
+                .iter()
+                .map(|(_, n, role)| format!("{} ({})", n, role))
+                .collect();
             out.push_str(&format!("狼队友：{}\n", names.join("、")));
         }
         if !self.seer_log.is_empty() {
@@ -77,6 +84,15 @@ impl<'a> PublicView<'a> {
                     n,
                     if *w { "狼人" } else { "好人" }
                 ));
+            }
+        }
+        // 把"自己说过什么"放在事件历史前面 + 显眼，强化前后一致性
+        if !self.my_statements.is_empty() {
+            out.push_str("\n## ⚡ 你之前的公开发言（保持一致！前后矛盾会暴露你）\n");
+            for s in &self.my_statements {
+                out.push_str("  ");
+                out.push_str(s);
+                out.push('\n');
             }
         }
         if !self.event_log.is_empty() {
@@ -103,16 +119,44 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         .map(|(i, p)| (i, p.name.clone(), p.alive))
         .collect();
 
-    let teammates = if role == Role::Werewolf {
+    // 狼队友：含狼人 + 狼王（之前 bug：只挑 Werewolf 漏了 WolfKing）
+    let teammates = if role.is_wolf() {
         game.players
             .iter()
             .enumerate()
-            .filter(|(i, p)| p.role == Some(Role::Werewolf) && *i != ai_idx)
-            .map(|(i, p)| (i, p.name.clone()))
+            .filter(|(i, p)| {
+                p.role.map(|r| r.is_wolf()).unwrap_or(false) && *i != ai_idx
+            })
+            .map(|(i, p)| {
+                let role_label = p.role.map(|r| r.label()).unwrap_or("狼");
+                (i, p.name.clone(), role_label)
+            })
             .collect()
     } else {
         vec![]
     };
+
+    // 自己的公开发言历史，从 recap_log 提取（结构化，不依赖文本匹配）
+    use crate::werewolf::game::RecapEvent;
+    let my_statements: Vec<String> = game
+        .recap_log
+        .iter()
+        .filter_map(|e| match e {
+            RecapEvent::SheriffSpeech { player, text } if *player == ai_idx => {
+                Some(format!("[上警发言] {}", text))
+            }
+            RecapEvent::SheriffSideSpeech { player, text } if *player == ai_idx => {
+                Some(format!("[警下发言] {}", text))
+            }
+            RecapEvent::DaySpeech { player, text, day, .. } if *player == ai_idx => {
+                Some(format!("[第 {day} 天发言] {}", text))
+            }
+            RecapEvent::LastWords { player, text, .. } if *player == ai_idx => {
+                Some(format!("[遗言] {}", text))
+            }
+            _ => None,
+        })
+        .collect();
 
     let seer_log = if role == Role::Seer {
         game.seer_history
@@ -140,6 +184,7 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         teammates,
         seer_log,
         event_log: &game.event_log,
+        my_statements,
     }
 }
 
