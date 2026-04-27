@@ -31,8 +31,11 @@ RUN cargo test --locked
 FROM test AS builder
 RUN cargo build --release --locked
 
-# ---------- runtime: distroless base, ≈ 30 MB final image, runs as nonroot
-FROM gcr.io/distroless/base-debian12:nonroot
+# ---------- runtime: distroless cc, ≈ 32 MB final image, runs as nonroot.
+# Note: must be `cc` (= base + libgcc + libstdc++), NOT `base`. Rust's default
+# `panic = unwind` dlopens libgcc_s.so.1 at runtime; without it the binary
+# fails to start with "error while loading shared libraries: libgcc_s.so.1".
+FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/target/release/lark-poker /app/lark-poker
 
 EXPOSE 8080
