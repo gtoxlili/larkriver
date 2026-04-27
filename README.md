@@ -14,6 +14,13 @@ cp .env.example .env
 cargo run --release
 ```
 
+### Run with Docker
+
+```bash
+docker build -t lark-poker .
+docker run --rm -p 8080:8080 --env-file .env lark-poker
+```
+
 Then expose the HTTP port (default `:8080`) to the public internet (e.g. `ngrok http 8080`)
 and set the resulting `https://.../webhook/event` and `https://.../webhook/card` URLs in
 your Feishu app's **Event Subscriptions** and **Card Request URL** pages.

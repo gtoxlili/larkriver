@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+.env
+.env.local
+.env.example
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+README.md
+Dockerfile
+.dockerignore
