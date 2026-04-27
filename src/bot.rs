@@ -5,6 +5,7 @@ use crate::feishu::Client as FeishuClient;
 use crate::game::*;
 use crate::llm::{DecisionContext, LlmClient};
 use crate::poker::{category_name, DeckMode};
+use crate::storage::Store;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -30,6 +31,8 @@ pub struct Bot {
     seen_actions: Mutex<HashMap<String, Instant>>,
     /// LLM client. `None` when `OPENAI_API_KEY` is unset → AI features hide.
     llm: Option<LlmClient>,
+    /// Disk-backed game state. Loaded on startup, written after each mutation.
+    store: Arc<Store>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,22 +47,52 @@ enum Command {
 }
 
 impl Bot {
-    pub fn new(client: Arc<FeishuClient>, cfg: Config) -> Arc<Self> {
+    pub fn new(client: Arc<FeishuClient>, cfg: Config, store: Arc<Store>) -> Arc<Self> {
         let llm = cfg.openai_api_key.clone().map(|key| {
             LlmClient::new(key, cfg.openai_base_url.clone(), cfg.openai_model.clone())
         });
         if llm.is_some() {
             info!(model = %cfg.openai_model, "LLM AI seat enabled");
         }
+        // Replay persisted games. Any in-flight hand is treated like a "stuck"
+        // hand by start_hand: refunded + reset on the next [开局].
+        let games = match store.load_all() {
+            Ok(loaded) => {
+                if !loaded.is_empty() {
+                    info!(count = loaded.len(), "restored games from disk");
+                }
+                loaded
+            }
+            Err(e) => {
+                warn!(?e, "failed to load games from disk; starting empty");
+                HashMap::new()
+            }
+        };
         Arc::new(Self {
             client,
             cfg,
-            games: Mutex::new(HashMap::new()),
+            games: Mutex::new(games),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(HashMap::new()),
             seen_actions: Mutex::new(HashMap::new()),
             llm,
+            store,
         })
+    }
+
+    /// Save the current `Game` for `chat_id` to disk. Call from inside a
+    /// `games.lock()` scope right after a successful mutation so persistence
+    /// is serialised with the state change.
+    fn persist_locked(&self, chat_id: &str, game: &Game) {
+        if let Err(e) = self.store.save(chat_id, game) {
+            warn!(?e, %chat_id, "persist game failed");
+        }
+    }
+
+    fn forget_chat(&self, chat_id: &str) {
+        if let Err(e) = self.store.delete(chat_id) {
+            warn!(?e, %chat_id, "delete game failed");
+        }
     }
 
     /// Returns true if `event_id` has been seen in the last ~2 minutes.
@@ -226,6 +259,7 @@ impl Bot {
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Game::new(chat_id.to_string()));
             game.add_player(open_id.to_string(), name.to_string())?;
+            self.persist_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
@@ -237,6 +271,7 @@ impl Bot {
                 .get_mut(chat_id)
                 .ok_or_else(|| anyhow!("当前没有牌局"))?;
             let _removed = game.remove_last_ai()?;
+            self.persist_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
@@ -255,6 +290,7 @@ impl Bot {
             let ai_id = format!("ai:{}", n);
             let ai_name = format!("AI #{}", n);
             game.add_ai_player(ai_id, ai_name)?;
+            self.persist_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
@@ -266,6 +302,7 @@ impl Bot {
                 .get_mut(chat_id)
                 .ok_or_else(|| anyhow!("当前没有牌局"))?;
             game.remove_player(open_id)?;
+            self.persist_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
@@ -274,6 +311,7 @@ impl Bot {
         {
             self.games.lock().remove(chat_id);
         }
+        self.forget_chat(chat_id);
         // After reset, post a fresh lobby card to invite players in.
         let _ = self.refresh_lobby(chat_id).await;
         let c = card(
@@ -309,6 +347,7 @@ impl Bot {
             .await?;
         if let Some(g) = self.games.lock().get_mut(chat_id) {
             g.lobby_msg_id = Some(new_id);
+            self.persist_locked(chat_id, g);
         }
         Ok(())
     }
@@ -384,6 +423,7 @@ impl Bot {
                 .get_mut(chat_id)
                 .ok_or_else(|| anyhow!("当前没有牌局, 先 join"))?;
             game.start_hand(mode)?;
+            self.persist_locked(chat_id, game);
             let snap = snapshot(game);
             // Only humans get ephemeral hole-card messages — AI seats have
             // synthetic open_ids that Feishu would reject.
@@ -616,7 +656,10 @@ impl Bot {
                 .get_mut(&chat_id)
                 .ok_or_else(|| anyhow!("game missing"))?;
             match g.act(&action.open_id, player_action) {
-                Ok(outcome) => Ok((outcome, snapshot(g))),
+                Ok(outcome) => {
+                    self.persist_locked(&chat_id, g);
+                    Ok((outcome, snapshot(g)))
+                }
                 Err(e) => Err(e),
             }
         };
@@ -677,6 +720,7 @@ impl Bot {
             // next-hand buttons are visible at the bottom of the chat.
             if let Some(g) = self.games.lock().get_mut(chat_id) {
                 g.lobby_msg_id = None;
+                self.persist_locked(chat_id, g);
             }
             let _ = self.refresh_lobby(chat_id).await;
         }
@@ -714,7 +758,11 @@ impl Bot {
             let result = {
                 let mut games = self.games.lock();
                 let Some(g) = games.get_mut(chat_id) else { return; };
-                g.act(&actor_id, action).map(|outcome| (outcome, snapshot(g)))
+                let r = g.act(&actor_id, action).map(|outcome| (outcome, snapshot(g)));
+                if r.is_ok() {
+                    self.persist_locked(chat_id, g);
+                }
+                r
             };
             match result {
                 Ok((outcome, snap)) => {

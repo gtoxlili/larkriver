@@ -18,6 +18,7 @@ parking_lot = "0.12"
 itertools = "0.13"
 uuid = { version = "1", features = ["v4"] }
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
+redb = "2"
 
 [profile.release]
 opt-level = 3
@@ -29,3 +30,6 @@ strip = "symbols"    # drop symbol tables from the final binary
 # so cargo test isn't painfully slow once we bump the release profile.
 [profile.dev.package."*"]
 opt-level = 1
+
+[dev-dependencies]
+tempfile = "3"

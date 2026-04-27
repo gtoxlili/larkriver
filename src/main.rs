@@ -5,6 +5,7 @@ mod game;
 mod llm;
 mod poker;
 mod server;
+mod storage;
 
 use anyhow::Result;
 use std::time::Duration;
@@ -22,7 +23,9 @@ async fn main() -> Result<()> {
         tracing::info!("bot open_id = {id}");
     }
 
-    let bot = bot::Bot::new(client.clone(), cfg);
+    let store = storage::Store::open(std::path::Path::new(&cfg.db_path))?;
+    tracing::info!(path = %cfg.db_path, "persistent store opened");
+    let bot = bot::Bot::new(client.clone(), cfg, store);
     if let Ok(id) = lookup_bot_open_id(&client).await {
         bot.set_bot_open_id(id);
     }

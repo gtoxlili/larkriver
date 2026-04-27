@@ -19,7 +19,7 @@ pub use hand::{best_five, category_name, evaluate, HandRank};
 ///   ranks span 5 of 9 instead of 5 of 13).
 /// - The low straight uses the ace as the bottom: **A-6-7-8-9** (vs A-2-3-4-5
 ///   in Standard).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DeckMode {
     Standard,
     ShortDeck,

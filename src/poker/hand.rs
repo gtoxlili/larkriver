@@ -3,7 +3,7 @@ use super::DeckMode;
 use itertools::Itertools;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct HandRank {
     pub category: u8,
     pub kickers: [u8; 5],

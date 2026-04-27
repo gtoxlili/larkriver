@@ -1,5 +1,6 @@
 use crate::poker::{best_five, category_name, Card, Deck, DeckMode, HandRank};
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 
 /// Default chip stack each player starts with.
 pub const STARTING_CHIPS: u64 = 1000;
@@ -8,7 +9,7 @@ pub const SMALL_BLIND: u64 = 5;
 /// Big blind for every hand.
 pub const BIG_BLIND: u64 = 10;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
     pub open_id: String,
     pub name: String,
@@ -20,13 +21,13 @@ pub struct Player {
     pub all_in: bool,
     pub acted_this_round: bool,
     pub sat_out: bool, // out of chips, skipped this hand
-    /// LLM-driven seat. `open_id` is a synthetic id like `ai:doubao:1` that
+    /// LLM-driven seat. `open_id` is a synthetic id like `ai:1` that
     /// won't resolve in Feishu — display code substitutes the name instead of
     /// rendering an `<at>` tag.
     pub is_ai: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
     Lobby,
     PreFlop,
@@ -51,7 +52,7 @@ impl Stage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionKind {
     Fold,
     Check,
@@ -72,7 +73,7 @@ pub enum PlayerAction {
     AllIn,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionLogEntry {
     pub player_idx: usize,
     pub kind: ActionKind,
@@ -111,6 +112,7 @@ pub struct ActOutcome {
     pub next_actor_open_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
     pub chat_id: String,
     pub players: Vec<Player>,
@@ -401,6 +403,7 @@ impl Game {
         }
 
         let log = self.apply_action(idx, action)?;
+        self.action_log.push(log.clone());
 
         // Mark the actor as having acted this round
         self.players[idx].acted_this_round = true;

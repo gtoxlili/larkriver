@@ -63,6 +63,7 @@ impl Card {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deck {
     cards: Vec<Card>,
 }
