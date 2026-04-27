@@ -30,6 +30,10 @@ RUN cargo test --locked
 # Reuses the cooked release deps; only the larkriver crate links here.
 FROM test AS builder
 RUN cargo build --release --locked
+# An empty stub directory we can COPY --chown into the runtime image so /data
+# ends up owned by the nonroot user. distroless has no shell, so we can't
+# `mkdir` or `chown` in the runtime stage directly.
+RUN mkdir -p /datadir
 
 # ---------- runtime: distroless cc, ≈ 32 MB final image, runs as nonroot.
 # Note: must be `cc` (= base + libgcc + libstdc++), NOT `base`. Rust's default
@@ -37,6 +41,12 @@ RUN cargo build --release --locked
 # fails to start with "error while loading shared libraries: libgcc_s.so.1".
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /app/target/release/larkriver /app/larkriver
+# Pre-create /data owned by uid 65532 (`nonroot`). When users mount a fresh
+# named docker volume here, Docker initialises it from this directory and
+# preserves the ownership — so redb can actually write to /data/larkriver.redb.
+# Without this, named volumes inherit root ownership and the bot crashes on
+# startup with "Permission denied" trying to open the database file.
+COPY --from=builder --chown=nonroot:nonroot /datadir /data
 
 EXPOSE 8080
 ENV RUST_LOG=larkriver=info,tower_http=info \
