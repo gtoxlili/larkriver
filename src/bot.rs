@@ -3,7 +3,7 @@ use crate::feishu::cards::*;
 use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
 use crate::game::*;
-use crate::poker::category_name;
+use crate::poker::{category_name, DeckMode};
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -317,16 +317,22 @@ impl Bot {
     }
 
     async fn cmd_start(&self, msg: &InboundMessage) -> Result<()> {
-        self.do_start(&msg.chat_id).await
+        // Allow `/poker start short` (or 短牌) to pick the short-deck variant.
+        let mode = if msg.text.contains("short") || msg.text.contains("短牌") {
+            DeckMode::ShortDeck
+        } else {
+            DeckMode::Standard
+        };
+        self.do_start(&msg.chat_id, mode).await
     }
 
-    async fn do_start(&self, chat_id: &str) -> Result<()> {
+    async fn do_start(&self, chat_id: &str, mode: DeckMode) -> Result<()> {
         let (snap, hole_cards) = {
             let mut games = self.games.lock();
             let game = games
                 .get_mut(chat_id)
                 .ok_or_else(|| anyhow!("当前没有牌局, 先 join"))?;
-            game.start_hand()?;
+            game.start_hand(mode)?;
             let snap = snapshot(game);
             let hole: Vec<(String, String, Vec<crate::poker::Card>)> = game
                 .players
@@ -430,7 +436,7 @@ impl Bot {
         // return immediately so the webhook responds inside Feishu's timeout.
         if matches!(
             action_id.as_str(),
-            "join_lobby" | "leave_lobby" | "start_lobby"
+            "join_lobby" | "leave_lobby" | "start_lobby" | "start_lobby_short"
         ) {
             let bot = self.clone();
             let aid = action_id.clone();
@@ -447,7 +453,8 @@ impl Bot {
                         bot.do_join(&cid, &oid, &name).await
                     }
                     "leave_lobby" => bot.do_leave(&cid, &oid).await,
-                    "start_lobby" => bot.do_start(&cid).await,
+                    "start_lobby" => bot.do_start(&cid, DeckMode::Standard).await,
+                    "start_lobby_short" => bot.do_start(&cid, DeckMode::ShortDeck).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = res {
@@ -689,7 +696,7 @@ impl Bot {
                 elements.push(markdown(&format!(
                     "{} · {}",
                     at(&p.open_id),
-                    category_name(s.rank.category)
+                    category_name(s.rank.category, snap.mode)
                 )));
                 elements.push(markdown("手牌"));
                 elements.push(cards_row(&s.hole));
@@ -829,6 +836,7 @@ impl Bot {
             pot: 0, current_bet: 0, min_raise: 10, big_blind: 10,
             dealer_idx: 0, current_open_id: None, players: vec![],
             viewer_hole: vec![],
+            mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_empty)).await?;
@@ -846,6 +854,7 @@ impl Bot {
             dealer_idx: 0, current_open_id: None,
             players: vec![mk(&alice, "Alice", 1000, 0), mk(&bob, "Bob", 1000, 0)],
             viewer_hole: vec![],
+            mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_lobby2)).await?;
@@ -863,6 +872,7 @@ impl Bot {
             dealer_idx: 0, current_open_id: Some(alice.clone()),
             players: vec![mk(&alice, "Alice", 970, 0), mk(&bob, "Bob", 970, 0)],
             viewer_hole: vec![],
+            mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_lobby_card(&snap_lobby_inprog)).await?;
@@ -883,6 +893,7 @@ impl Bot {
                 mk(&bob, "Bob", 990, 10),     // BB
             ],
             viewer_hole: vec![],
+            mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
             &build_hand_start_card(&snap_start)).await?;
@@ -913,6 +924,7 @@ impl Bot {
             // Hole cards for the actor (Alice) so the mock action card shows
             // the "你的手牌" row.
             viewer_hole: vec![c(14, Suit::Spades), c(13, Suit::Spades)],
+            mode: DeckMode::Standard,
         };
 
         // --------- 8. state - public ---------
@@ -978,10 +990,10 @@ impl Bot {
         let community = snap_river.community.clone();
         let mut alice7 = alice_hole.clone();
         alice7.extend(community.iter().copied());
-        let (alice_rank, alice_best) = best_five(&alice7);
+        let (alice_rank, alice_best) = best_five(&alice7, DeckMode::Standard);
         let mut bob7 = bob_hole.clone();
         bob7.extend(community.iter().copied());
-        let (bob_rank, bob_best) = best_five(&bob7);
+        let (bob_rank, bob_best) = best_five(&bob7, DeckMode::Standard);
         let winner_idx = if alice_rank > bob_rank { 0 } else { 1 };
         let winning_rank = if alice_rank > bob_rank { alice_rank } else { bob_rank };
         let summary = HandSummary {
@@ -992,7 +1004,7 @@ impl Bot {
             payouts: vec![PotPayout {
                 amount: 120,
                 winners: vec![winner_idx],
-                note: crate::poker::category_name(winning_rank.category).to_string(),
+                note: crate::poker::category_name(winning_rank.category, DeckMode::Standard).to_string(),
             }],
         };
         let mut snap_show = snap_river.clone();
@@ -1089,6 +1101,9 @@ pub struct GameSnapshot {
     /// unless the snapshot is being shown to a specific player (e.g. their
     /// own action prompt or a `/poker state` reply).
     pub viewer_hole: Vec<crate::poker::Card>,
+    /// Deck variant for this hand — short-deck swaps trips/straight and
+    /// flush/full-house ranks, and uses A-6-7-8-9 for the wheel.
+    pub mode: DeckMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1153,7 @@ fn snapshot_for(g: &Game, viewer_open_id: Option<&str>) -> GameSnapshot {
             })
             .collect(),
         viewer_hole,
+        mode: g.mode,
     }
 }
 
@@ -1281,6 +1297,11 @@ fn build_lobby_card(snap: &GameSnapshot) -> Value {
                 merge(&v_base, &json!({ "action": "start_lobby" })),
                 "primary",
             ));
+            buttons.push(button(
+                "短牌",
+                merge(&v_base, &json!({ "action": "start_lobby_short" })),
+                "default",
+            ));
         }
         elements.push(actions(buttons));
         elements.push(note_md(
@@ -1326,7 +1347,7 @@ fn compute_viewer_stats(
     if !in_progress {
         return None;
     }
-    let equity = crate::poker::equity(&snap.viewer_hole, &snap.community, n_opponents, 2000);
+    let equity = crate::poker::equity(&snap.viewer_hole, &snap.community, n_opponents, 2000, snap.mode);
     let to_call = snap
         .players
         .iter()
@@ -1611,9 +1632,13 @@ fn build_hand_start_card(snap: &GameSnapshot) -> Value {
     if let Some(actor_id) = &snap.current_open_id {
         body.push_str(&format!("\n↓ 首位 {}", at(actor_id)));
     }
+    let title = match snap.mode {
+        DeckMode::Standard => format!("🂠 第 {} 局开始", snap.hand_count),
+        DeckMode::ShortDeck => format!("🂠 第 {} 局开始 · 短牌", snap.hand_count),
+    };
     card(
         header_with_subtitle(
-            &format!("🂠 第 {} 局开始", snap.hand_count),
+            &title,
             &format!("底池 {}", snap.pot),
             "turquoise",
         ),

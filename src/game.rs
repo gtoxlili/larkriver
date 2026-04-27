@@ -1,4 +1,4 @@
-use crate::poker::{best_five, category_name, Card, Deck, HandRank};
+use crate::poker::{best_five, category_name, Card, Deck, DeckMode, HandRank};
 use anyhow::{anyhow, Result};
 
 /// Default chip stack each player starts with.
@@ -124,6 +124,8 @@ pub struct Game {
     pub last_action_msg_id: Option<String>,
     /// Message id of the persistent lobby card. Updated in place on join/leave.
     pub lobby_msg_id: Option<String>,
+    /// Current hand's deck variant. Set fresh each `start_hand`.
+    pub mode: DeckMode,
 }
 
 impl Game {
@@ -132,7 +134,7 @@ impl Game {
             chat_id,
             players: vec![],
             stage: Stage::Lobby,
-            deck: Deck::shuffled(),
+            deck: Deck::shuffled(DeckMode::Standard),
             community: vec![],
             current_bet: 0,
             min_raise: BIG_BLIND,
@@ -144,6 +146,7 @@ impl Game {
             action_log: vec![],
             last_action_msg_id: None,
             lobby_msg_id: None,
+            mode: DeckMode::Standard,
         }
     }
 
@@ -208,7 +211,7 @@ impl Game {
     /// callback delivery (a duplicated [开局] click would silently void the
     /// just-dealt pot and re-deal). If the table genuinely gets stuck, use
     /// `/poker reset` to wipe and start over.
-    pub fn start_hand(&mut self) -> Result<()> {
+    pub fn start_hand(&mut self, mode: DeckMode) -> Result<()> {
         if !matches!(self.stage, Stage::Lobby | Stage::Ended) {
             return Err(anyhow!(
                 "已经在牌局中（{}）。卡住可用 /poker reset 重置牌桌",
@@ -228,7 +231,8 @@ impl Game {
         }
 
         // Reset per-hand state
-        self.deck = Deck::shuffled();
+        self.mode = mode;
+        self.deck = Deck::shuffled(mode);
         self.community.clear();
         self.action_log.clear();
         self.current_bet = self.big_blind;
@@ -645,7 +649,7 @@ impl Game {
             .map(|(i, p)| {
                 let mut all = p.hole.clone();
                 all.extend(self.community.iter().copied());
-                let (rank, best) = best_five(&all);
+                let (rank, best) = best_five(&all, self.mode);
                 ShowdownResult {
                     player_idx: i,
                     hole: p.hole.clone(),
@@ -687,7 +691,7 @@ impl Game {
             payouts.push(PotPayout {
                 amount: pot_amount,
                 winners,
-                note: format!("{}", category_name(best.category)),
+                note: format!("{}", category_name(best.category, self.mode)),
             });
         }
 
@@ -759,7 +763,7 @@ mod tests {
         let mut g = Game::new("c".into());
         add(&mut g, "a", "Alice");
         add(&mut g, "b", "Bob");
-        g.start_hand().unwrap();
+        g.start_hand(DeckMode::Standard).unwrap();
         // dealer is 0 (Alice) heads-up: Alice = SB, Bob = BB, Alice acts first
         assert_eq!(g.players[0].bet_in_round, SMALL_BLIND);
         assert_eq!(g.players[1].bet_in_round, BIG_BLIND);
@@ -771,7 +775,7 @@ mod tests {
         let mut g = Game::new("c".into());
         add(&mut g, "a", "Alice");
         add(&mut g, "b", "Bob");
-        g.start_hand().unwrap();
+        g.start_hand(DeckMode::Standard).unwrap();
         let outcome = g.act("a", PlayerAction::Fold).unwrap();
         assert!(outcome.summary.is_some());
         // Bob wins the pot (5 + 10 = 15)
@@ -783,7 +787,7 @@ mod tests {
         let mut g = Game::new("c".into());
         add(&mut g, "a", "Alice");
         add(&mut g, "b", "Bob");
-        g.start_hand().unwrap();
+        g.start_hand(DeckMode::Standard).unwrap();
         // Alice (SB) calls 5 to match BB
         g.act("a", PlayerAction::Call).unwrap();
         // Bob (BB) checks
@@ -813,8 +817,8 @@ mod tests {
         let mut g = Game::new("c".into());
         add(&mut g, "a", "Alice");
         add(&mut g, "b", "Bob");
-        g.start_hand().unwrap();
-        let err = g.start_hand().unwrap_err();
+        g.start_hand(DeckMode::Standard).unwrap();
+        let err = g.start_hand(DeckMode::Standard).unwrap_err();
         assert!(
             err.to_string().contains("已经在牌局中"),
             "expected mid-hand error, got: {err}"
@@ -828,7 +832,7 @@ mod tests {
         add(&mut g, "a", "Alice");
         add(&mut g, "b", "Bob");
         add(&mut g, "c", "Carol");
-        g.start_hand().unwrap();
+        g.start_hand(DeckMode::Standard).unwrap();
         // first to act is Carol (UTG = dealer + 3 = 0 + 3 mod 3 = 0)
         // wait, with 3 players: dealer=0, SB=1, BB=2, first preflop = (0+3)%3 = 0 = Alice (dealer)
         // So Alice acts first.

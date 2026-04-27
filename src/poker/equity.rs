@@ -14,10 +14,15 @@ use std::collections::HashSet;
 
 use super::card::{Card, Rank, Suit};
 use super::hand::evaluate;
+use super::DeckMode;
 
-fn full_deck() -> Vec<Card> {
+fn full_deck(mode: DeckMode) -> Vec<Card> {
+    let low = match mode {
+        DeckMode::Standard => 2u8,
+        DeckMode::ShortDeck => 6u8,
+    };
     let mut cards = Vec::with_capacity(52);
-    for r in 2..=14u8 {
+    for r in low..=14u8 {
         for s in [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs] {
             cards.push(Card {
                 rank: Rank(r),
@@ -33,6 +38,7 @@ pub fn equity(
     community: &[Card],
     n_opponents: usize,
     iterations: u32,
+    mode: DeckMode,
 ) -> f64 {
     if hole.len() != 2 || n_opponents == 0 || iterations == 0 {
         return 0.0;
@@ -41,7 +47,7 @@ pub fn equity(
     let need_total = 2 * n_opponents + need_community;
 
     let used: HashSet<Card> = hole.iter().chain(community.iter()).copied().collect();
-    let mut remaining: Vec<Card> = full_deck().into_iter().filter(|c| !used.contains(c)).collect();
+    let mut remaining: Vec<Card> = full_deck(mode).into_iter().filter(|c| !used.contains(c)).collect();
     if remaining.len() < need_total {
         return 0.0;
     }
@@ -69,7 +75,7 @@ pub fn equity(
         seven.clear();
         seven.extend_from_slice(hole);
         seven.extend_from_slice(&full_community);
-        let hero_rank = evaluate(&seven);
+        let hero_rank = evaluate(&seven, mode);
 
         // Best opponent
         let mut max_opp = None;
@@ -78,7 +84,7 @@ pub fn equity(
             seven.push(remaining[2 * i]);
             seven.push(remaining[2 * i + 1]);
             seven.extend_from_slice(&full_community);
-            let r = evaluate(&seven);
+            let r = evaluate(&seven, mode);
             max_opp = match max_opp {
                 Some(m) if m >= r => Some(m),
                 _ => Some(r),
@@ -108,7 +114,7 @@ mod tests {
     #[test]
     fn pocket_aces_dominates_preflop() {
         let aa = vec![c(14, Suit::Spades), c(14, Suit::Hearts)];
-        let eq_heads_up = equity(&aa, &[], 1, 1000);
+        let eq_heads_up = equity(&aa, &[], 1, 1000, DeckMode::Standard);
         // Pocket aces head-up vs random hand is ~85% — give wide bounds for the
         // sample variance at 1k iters.
         assert!(eq_heads_up > 0.78, "expected AA HU equity > 0.78, got {eq_heads_up}");
@@ -125,7 +131,7 @@ mod tests {
             c(11, Suit::Hearts),
             c(4, Suit::Diamonds),
         ];
-        let eq = equity(&hole, &board, 1, 500);
+        let eq = equity(&hole, &board, 1, 500, DeckMode::Standard);
         // Ace-high flush on the river — opponent can only beat us with a
         // straight flush or higher. Should be > 0.95.
         assert!(eq > 0.95, "expected near-lock equity, got {eq}");
@@ -133,8 +139,21 @@ mod tests {
 
     #[test]
     fn empty_inputs_dont_panic() {
-        assert_eq!(equity(&[], &[], 1, 100), 0.0);
+        assert_eq!(equity(&[], &[], 1, 100, DeckMode::Standard), 0.0);
         let aa = vec![c(14, Suit::Spades), c(14, Suit::Hearts)];
-        assert_eq!(equity(&aa, &[], 0, 100), 0.0);
+        assert_eq!(equity(&aa, &[], 0, 100, DeckMode::Standard), 0.0);
+    }
+
+    #[test]
+    fn shortdeck_aa_preflop_lower_than_standard() {
+        // In short deck (36-card), AA pre-flop has noticeably lower equity
+        // because opponents are more likely to flop sets / straights.
+        let aa = vec![c(14, Suit::Spades), c(14, Suit::Hearts)];
+        let eq_std = equity(&aa, &[], 4, 1000, DeckMode::Standard);
+        let eq_short = equity(&aa, &[], 4, 1000, DeckMode::ShortDeck);
+        assert!(
+            eq_short < eq_std,
+            "short-deck AA equity should be lower: std={eq_std} short={eq_short}"
+        );
     }
 }

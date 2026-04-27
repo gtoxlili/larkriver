@@ -2,6 +2,8 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 
+use super::DeckMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Suit {
     Spades,
@@ -66,9 +68,13 @@ pub struct Deck {
 }
 
 impl Deck {
-    pub fn shuffled() -> Self {
+    pub fn shuffled(mode: DeckMode) -> Self {
+        let low = match mode {
+            DeckMode::Standard => 2u8,
+            DeckMode::ShortDeck => 6u8,
+        };
         let mut cards = Vec::with_capacity(52);
-        for r in 2..=14u8 {
+        for r in low..=14u8 {
             for s in [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs] {
                 cards.push(Card { rank: Rank(r), suit: s });
             }
