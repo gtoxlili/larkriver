@@ -18,11 +18,15 @@ pub struct Bot {
     cfg: Config,
     games: Mutex<HashMap<String, Game>>, // chat_id → game
     bot_open_id: Mutex<Option<String>>,
-    /// LRU-ish dedup cache for callback `event_id`. Feishu sometimes delivers
-    /// the same callback twice (retries, schema-version mirroring) — without
-    /// this, the second delivery hits a state that's already advanced and the
-    /// user sees a phantom "无法执行" / "还没轮到你" toast on top of the real one.
+    /// Dedup cache keyed by `header.event_id` — catches Feishu's same-id
+    /// retries within a long window.
     seen_events: Mutex<HashMap<String, Instant>>,
+    /// Fallback dedup keyed by a content fingerprint of card actions
+    /// (`open_id` + `value` JSON). Catches the empirical case where Feishu
+    /// re-delivers the *same logical click* under a different `event_id`.
+    /// Short window (a few seconds) so legitimate re-clicks later are still
+    /// processed.
+    seen_actions: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,25 +48,57 @@ impl Bot {
             games: Mutex::new(HashMap::new()),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(HashMap::new()),
+            seen_actions: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Returns true if `event_id` has been seen in the last ~2 minutes —
-    /// callers should drop the event in that case. Empty `event_id`
-    /// (legacy payloads without one) is never deduped.
+    /// Returns true if `event_id` has been seen in the last ~2 minutes.
+    /// Empty `event_id` (legacy payloads without one) is never deduped.
     fn is_duplicate_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() {
             return false;
         }
         let mut seen = self.seen_events.lock();
-        // Cheap GC: drop entries older than 120s on every insert.
         seen.retain(|_, t| t.elapsed() < Duration::from_secs(120));
-        if seen.contains_key(event_id) {
+        if let Some(first_seen) = seen.get(event_id) {
+            let age_ms = first_seen.elapsed().as_millis();
+            warn!(
+                event_id,
+                age_ms,
+                "duplicate callback dropped (event_id match)"
+            );
             true
         } else {
             seen.insert(event_id.to_string(), Instant::now());
             false
         }
+    }
+
+    /// Fallback dedup for card actions: same `(open_id, value)` fingerprint
+    /// within ~3s is treated as a duplicate. This catches Feishu re-delivering
+    /// the same logical click under different `event_id`s (which we've
+    /// observed in practice — the docs claim card callbacks aren't retried,
+    /// but they sometimes are).
+    fn is_duplicate_action(&self, action: &CardAction) -> bool {
+        let fingerprint = format!(
+            "{}|{}",
+            action.open_id,
+            serde_json::to_string(&action.value).unwrap_or_default()
+        );
+        let mut seen = self.seen_actions.lock();
+        seen.retain(|_, t| t.elapsed() < Duration::from_secs(10));
+        if let Some(first_seen) = seen.get(&fingerprint) {
+            if first_seen.elapsed() < Duration::from_secs(3) {
+                let age_ms = first_seen.elapsed().as_millis();
+                warn!(
+                    age_ms,
+                    "duplicate callback dropped (action fingerprint match within 3s)"
+                );
+                return true;
+            }
+        }
+        seen.insert(fingerprint, Instant::now());
+        false
     }
 
     pub fn cfg(&self) -> &Config {
@@ -362,7 +398,10 @@ impl Bot {
     }
 
     pub async fn handle_card_action(self: Arc<Self>, action: CardAction) -> Result<Value> {
-        if self.is_duplicate_event(&action.event_id) {
+        // Two layers of dedup. event_id catches Feishu's same-id retries;
+        // the action fingerprint catches the trickier case where the same
+        // click is re-delivered with a different event_id.
+        if self.is_duplicate_event(&action.event_id) || self.is_duplicate_action(&action) {
             return Ok(json!({}));
         }
         let Some(action_id) = action
