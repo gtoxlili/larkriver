@@ -28,7 +28,6 @@ pub struct DecisionContext {
     pub hand_count: u32,
     pub pot: u64,
     pub current_bet: u64,
-    pub min_raise: u64,
     pub big_blind: u64,
     pub my_name: String,
     pub my_stack: u64,

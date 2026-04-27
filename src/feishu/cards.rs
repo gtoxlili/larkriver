@@ -249,11 +249,6 @@ pub fn person_list(open_ids: &[String]) -> Value {
 
 // ---------- text helpers ----------
 
-/// Plain text content for `msg_type=text` messages (not used for cards).
-pub fn text_content(text: &str) -> Value {
-    json!({ "text": text })
-}
-
 /// At-mention chunk usable inside markdown content.
 pub fn at(open_id: &str) -> String {
     format!("<at id=\"{open_id}\"></at>")

@@ -4,7 +4,7 @@ pub mod hand;
 
 pub use card::{Card, Deck, Rank, Suit};
 pub use equity::equity;
-pub use hand::{best_five, category_name, evaluate, HandRank};
+pub use hand::{best_five, category_name, HandRank};
 
 /// Which Texas Hold'em variant is in play.
 ///
@@ -23,13 +23,4 @@ pub use hand::{best_five, category_name, evaluate, HandRank};
 pub enum DeckMode {
     Standard,
     ShortDeck,
-}
-
-impl DeckMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            DeckMode::Standard => "标准",
-            DeckMode::ShortDeck => "短牌",
-        }
-    }
 }

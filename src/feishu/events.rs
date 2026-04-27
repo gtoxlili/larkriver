@@ -9,7 +9,6 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub event_id: String,
-    pub message_id: String,
     pub chat_id: String,
     pub chat_type: String, // "group" | "p2p"
     pub sender_open_id: String,
@@ -35,7 +34,6 @@ pub fn parse_inbound_message(payload: &Value) -> Option<InboundMessage> {
     let m = event.get("message")?;
     let chat_id = m.get("chat_id")?.as_str()?;
     let chat_type = m.get("chat_type")?.as_str().unwrap_or("group");
-    let message_id = m.get("message_id")?.as_str()?;
     let message_type = m.get("message_type")?.as_str().unwrap_or("text");
     let content_str = m.get("content")?.as_str()?;
     let content_json: Value = serde_json::from_str(content_str).unwrap_or(Value::Null);
@@ -58,7 +56,6 @@ pub fn parse_inbound_message(payload: &Value) -> Option<InboundMessage> {
     }
     Some(InboundMessage {
         event_id,
-        message_id: message_id.to_string(),
         chat_id: chat_id.to_string(),
         chat_type: chat_type.to_string(),
         sender_open_id: sender.to_string(),
@@ -76,7 +73,6 @@ pub struct CardAction {
     pub event_id: String,
     pub open_id: String,
     pub open_chat_id: String,
-    pub open_message_id: String,
     pub value: Value,
     /// `event.action.form_value` — populated when a form_submit button is clicked.
     /// Keys are the `name` of each input/select inside the form.
@@ -150,11 +146,6 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let open_message_id = event
-            .pointer("/context/open_message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         let value = event.pointer("/action/value").cloned().unwrap_or(Value::Null);
         let form_value = event
             .pointer("/action/form_value")
@@ -164,7 +155,6 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
             event_id,
             open_id,
             open_chat_id,
-            open_message_id,
             value,
             form_value,
         });
@@ -183,11 +173,6 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let open_message_id = payload
-        .get("open_message_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let value = payload
         .pointer("/action/value")
         .cloned()
@@ -200,7 +185,6 @@ pub fn parse_card_action(payload: &Value) -> Option<CardAction> {
         event_id,
         open_id,
         open_chat_id,
-        open_message_id,
         value,
         form_value,
     })

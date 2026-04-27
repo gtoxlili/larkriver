@@ -21,14 +21,6 @@ impl Suit {
             Suit::Clubs => "♣",
         }
     }
-
-    pub fn color_md(self) -> &'static str {
-        // lark_md supports inline colors via <font color=...>
-        match self {
-            Suit::Hearts | Suit::Diamonds => "red",
-            _ => "grey",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -56,10 +48,6 @@ pub struct Card {
 impl Card {
     pub fn label(self) -> String {
         format!("{}{}", self.rank.label(), self.suit.symbol())
-    }
-
-    pub fn label_md(self) -> String {
-        format!("`{}{}`", self.rank.label(), self.suit.symbol())
     }
 }
 

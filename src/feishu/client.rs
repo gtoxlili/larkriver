@@ -98,39 +98,7 @@ impl Client {
             .to_string())
     }
 
-    /// Reply to an existing message. Useful for threaded responses to commands.
-    pub async fn reply_message(
-        &self,
-        message_id: &str,
-        msg_type: &str,
-        content: &Value,
-    ) -> Result<String> {
-        let token = self.tenant_access_token().await?;
-        let url = format!("https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply");
-        let body = serde_json::json!({
-            "msg_type": msg_type,
-            "content": content.to_string(),
-            "uuid": uuid::Uuid::new_v4().to_string(),
-        });
-        let resp: Value = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp["code"].as_i64().unwrap_or(-1) != 0 {
-            return Err(anyhow!("reply failed: {resp}"));
-        }
-        Ok(resp["data"]["message_id"]
-            .as_str()
-            .unwrap_or("")
-            .to_string())
-    }
-
-    /// Send a card visible only to one user inside a group chat.
+/// Send a card visible only to one user inside a group chat.
     /// Returns the new message_id (this is a normal message id, not threaded).
     pub async fn send_ephemeral_card(
         &self,

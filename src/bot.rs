@@ -374,6 +374,7 @@ impl Bot {
                         all_in: p.all_in,
                         sat_out: p.sat_out,
                         is_ai: p.is_ai,
+                        persona: p.persona,
                     };
                     format!("• {} — **{}** 筹码", display_name(&snap_p), p.chips)
                 })
@@ -770,15 +771,15 @@ impl Bot {
             match result {
                 Ok((outcome, snap)) => {
                     let hand_ended = outcome.summary.is_some();
-                    let actor_name = snap
-                        .players
-                        .iter()
-                        .find(|p| p.open_id == actor_id)
+                    let actor = snap.players.iter().find(|p| p.open_id == actor_id);
+                    let actor_name = actor
                         .map(|p| p.name.clone())
                         .unwrap_or_else(|| actor_id.clone());
+                    let actor_persona = actor.and_then(|p| p.persona);
                     self.publish_action_messages(chat_id, &snap, &outcome).await;
                     if let Some(quip) = decision.quip {
-                        self.post_ai_quip(chat_id, &actor_name, &quip).await;
+                        self.post_ai_quip(chat_id, actor_persona, &actor_name, &quip)
+                            .await;
                     }
                     if hand_ended {
                         return;
@@ -813,13 +814,32 @@ impl Bot {
         }
     }
 
-    /// Post the AI's in-character one-liner to the group as a plain text
-    /// message. Best-effort — failures are swallowed.
-    async fn post_ai_quip(&self, chat_id: &str, ai_name: &str, quip: &str) {
-        let text = format!("💬 {}: {}", ai_name, quip);
+    /// Post the AI's in-character one-liner as a `post` (rich text) message:
+    /// persona emoji prefix, bolded AI name, then the quip. Card variants all
+    /// looked too heavy for a single short line; rich text gives just enough
+    /// styling (bold name) without any card chrome. Best-effort — failures
+    /// are swallowed.
+    async fn post_ai_quip(
+        &self,
+        chat_id: &str,
+        persona: Option<Persona>,
+        ai_name: &str,
+        quip: &str,
+    ) {
+        let prefix = persona.map(|p| p.emoji()).unwrap_or("💬");
+        let content = serde_json::json!({
+            "zh_cn": {
+                "title": "",
+                "content": [[
+                    { "tag": "text", "text": format!("{prefix} ") },
+                    { "tag": "text", "text": ai_name, "style": ["bold"] },
+                    { "tag": "text", "text": format!("：{quip}") },
+                ]]
+            }
+        });
         if let Err(e) = self
             .client
-            .send_message("chat_id", chat_id, "text", &text_content(&text))
+            .send_message("chat_id", chat_id, "post", &content)
             .await
         {
             warn!(?e, %chat_id, "failed to post AI quip");
@@ -879,7 +899,6 @@ impl Bot {
                 hand_count: g.hand_count,
                 pot: g.pot_total(),
                 current_bet: g.current_bet,
-                min_raise: g.min_raise,
                 big_blind: g.big_blind,
                 my_name: p.name.clone(),
                 my_stack: p.chips,
@@ -1089,6 +1108,7 @@ impl Bot {
             all_in: false,
             sat_out: false,
             is_ai: false,
+            persona: None,
         };
         let c = |r: u8, s: Suit| Card { rank: Rank(r), suit: s };
 
@@ -1417,6 +1437,7 @@ pub struct PlayerSnapshot {
     pub all_in: bool,
     pub sat_out: bool,
     pub is_ai: bool,
+    pub persona: Option<Persona>,
 }
 
 /// Render a player's name as either a Feishu @-mention (humans) or a styled
@@ -1463,6 +1484,7 @@ fn snapshot_for(g: &Game, viewer_open_id: Option<&str>) -> GameSnapshot {
                 all_in: p.all_in,
                 sat_out: p.sat_out,
                 is_ai: p.is_ai,
+                persona: p.persona,
             })
             .collect(),
         viewer_hole,

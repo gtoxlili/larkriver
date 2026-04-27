@@ -46,6 +46,19 @@ impl Persona {
         }
     }
 
+    /// Single emoji that represents the persona visually — used as the "avatar"
+    /// in chat-bubble cards so each AI has a recognisable face beyond just the
+    /// name suffix.
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Persona::LooseAggressive => "🐺",
+            Persona::TightAggressive => "🦈",
+            Persona::LooseWeak => "🐟",
+            Persona::TightWeak => "🪨",
+            Persona::Maniac => "🤪",
+        }
+    }
+
     pub fn random() -> Self {
         let all = [
             Persona::LooseAggressive,
@@ -169,7 +182,6 @@ pub struct ActOutcome {
     /// If multiple stages are dealt at once (all-in run-out), each stage's reveal.
     pub extra_stages: Vec<(Stage, Vec<Card>)>,
     pub summary: Option<HandSummary>,
-    pub next_actor_open_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,16 +303,7 @@ impl Game {
         Ok(self.players.remove(idx).name)
     }
 
-    pub fn reset_table(&mut self) {
-        self.players.clear();
-        self.stage = Stage::Lobby;
-        self.community.clear();
-        self.action_log.clear();
-        self.hand_count = 0;
-        self.dealer_idx = 0;
-    }
-
-    pub fn find_player(&self, open_id: &str) -> Option<usize> {
+pub fn find_player(&self, open_id: &str) -> Option<usize> {
         self.players.iter().position(|p| p.open_id == open_id)
     }
 
@@ -490,7 +493,6 @@ impl Game {
                 stage_cards: None,
                 extra_stages: vec![],
                 summary: Some(summary),
-                next_actor_open_id: None,
             });
         }
 
@@ -509,7 +511,6 @@ impl Game {
             stage_cards: None,
             extra_stages: vec![],
             summary: None,
-            next_actor_open_id: Some(self.players[next].open_id.clone()),
         })
     }
 
@@ -663,13 +664,6 @@ impl Game {
             None
         };
 
-        let next_actor_open_id = if self.stage == Stage::Ended {
-            None
-        } else {
-            self.first_to_act_postflop()
-                .map(|i| self.players[i].open_id.clone())
-        };
-
         if let Some(i) = self.first_to_act_postflop() {
             self.current_idx = i;
         }
@@ -679,7 +673,6 @@ impl Game {
             stage_cards: primary,
             extra_stages: extras,
             summary,
-            next_actor_open_id,
         }
     }
 
@@ -810,10 +803,6 @@ impl Game {
 
     pub fn current_player_open_id(&self) -> Option<&str> {
         self.players.get(self.current_idx).map(|p| p.open_id.as_str())
-    }
-
-    pub fn to_call_for(&self, idx: usize) -> u64 {
-        self.current_bet.saturating_sub(self.players[idx].bet_in_round)
     }
 }
 
