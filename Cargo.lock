@@ -553,7 +553,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lark-poker"
+name = "larkriver"
 version = "0.1.0"
 dependencies = [
  "anyhow",

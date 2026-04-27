@@ -1,5 +1,5 @@
 [package]
-name = "lark-poker"
+name = "larkriver"
 version = "0.1.0"
 edition = "2021"
 description = "Texas Hold'em poker bot for Feishu (Lark) group chats"

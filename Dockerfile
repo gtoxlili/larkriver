@@ -27,7 +27,7 @@ FROM source AS test
 RUN cargo test --locked
 
 # ---------- builder: depends on test, so tests must pass before binary build.
-# Reuses the cooked release deps; only the lark-poker crate links here.
+# Reuses the cooked release deps; only the larkriver crate links here.
 FROM test AS builder
 RUN cargo build --release --locked
 
@@ -36,10 +36,10 @@ RUN cargo build --release --locked
 # `panic = unwind` dlopens libgcc_s.so.1 at runtime; without it the binary
 # fails to start with "error while loading shared libraries: libgcc_s.so.1".
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=builder /app/target/release/lark-poker /app/lark-poker
+COPY --from=builder /app/target/release/larkriver /app/larkriver
 
 EXPOSE 8080
-ENV RUST_LOG=lark_poker=info,tower_http=info \
+ENV RUST_LOG=larkriver=info,tower_http=info \
     BIND_ADDR=0.0.0.0:8080
 
-ENTRYPOINT ["/app/lark-poker"]
+ENTRYPOINT ["/app/larkriver"]

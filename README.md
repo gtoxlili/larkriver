@@ -1,4 +1,4 @@
-# lark-poker
+# larkriver
 
 飞书群聊德州扑克机器人。
 
@@ -12,31 +12,21 @@
 ### 1. 拉镜像并运行
 
 ```bash
-docker pull ghcr.io/gtoxlili/lark-poker:latest
+docker pull ghcr.io/gtoxlili/larkriver:latest
 
 docker run -d \
-  --name lark-poker \
+  --name larkriver \
   --restart unless-stopped \
   -e FEISHU_APP_ID=<your_app_id> \
   -e FEISHU_APP_SECRET=<your_app_secret> \
   -e ALLOWED_CHAT_ID=<oc_xxx> \
   -e BIND_ADDR=0.0.0.0:8080 \
-  -e RUST_LOG=lark_poker=info,tower_http=info \
+  -e RUST_LOG=larkriver=info,tower_http=info \
   -p 8080:8080 \
-  ghcr.io/gtoxlili/lark-poker:latest
+  ghcr.io/gtoxlili/larkriver:latest
 ```
 
-### 2. HTTPS 反代
-
-飞书 webhook 必须 HTTPS。Caddy 示例：
-
-```caddy
-poker.your-domain.com {
-    reverse_proxy localhost:8080
-}
-```
-
-### 3. 飞书后台配置
+### 2. 飞书后台配置
 
 在 [飞书开放平台](https://open.feishu.cn/app) 新建企业自建应用，添加机器人能力。
 
@@ -51,7 +41,7 @@ poker.your-domain.com {
 **事件配置**（事件与回调 → 事件配置）
 
 - 订阅方式：将事件发送至开发者服务器
-- 请求地址：`https://poker.your-domain.com/webhook/event`
+- 请求地址：`http://<your-server>:8080/webhook/event`
 - 订阅事件：
   - `im.message.receive_v1`
   - `im.chat.member.user.added_v1`
@@ -60,7 +50,7 @@ poker.your-domain.com {
 
 **回调配置**（事件与回调 → 回调配置）
 
-- 请求地址：`https://poker.your-domain.com/webhook/card`
+- 请求地址：`http://<your-server>:8080/webhook/card`
 - 订阅回调：仅 `card.action.trigger`
 - 删除：`card.action.trigger_v1`、`url.preview.get`、`profile.view.get`
 
@@ -70,7 +60,7 @@ poker.your-domain.com {
 
 每次改完订阅或权限都要创建版本并发布。
 
-### 4. 把机器人拉进群
+### 3. 把机器人拉进群
 
 群设置 → 机器人 → 添加机器人。
 
@@ -91,26 +81,6 @@ poker.your-domain.com {
 也可以点持久化大厅卡上的 `[加入]` `[离开]` `[开局]` 按钮。
 
 行动按钮只发给当前 actor，仅他可见，包括 `[弃牌] [跟注 X] [全押]` 一行 + 加注 form 输入框 + 三个加注预设。
-
-## 自审应用版本
-
-如果有 admin bot 已开通 `application:application.app_version` scope，可调 PATCH API 给其他 bot 自动通过审核：
-
-```bash
-# 列待审版本
-curl -s "https://open.feishu.cn/open-apis/application/v6/applications/<APP_ID>/app_versions?page_size=5" \
-  -H "Authorization: Bearer <ADMIN_TOKEN>" \
-  | jq '.data.items[] | {version_id, version, status}'
-
-# status: 1=通过, 2=拒绝, 3=审核中, 4=未提交
-curl -X PATCH \
-  "https://open.feishu.cn/open-apis/application/v6/applications/<APP_ID>/app_versions/<oav_xxx>?user_id_type=open_id&operator_id=<YOUR_OPEN_ID>" \
-  -H "Authorization: Bearer <ADMIN_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"status": 1}'
-```
-
-`operator_id` 必须放在 query string，不在 body。
 
 ## 注意事项
 
@@ -140,8 +110,8 @@ src/
 ## 开发
 
 ```bash
-git clone https://github.com/gtoxlili/lark-poker
-cd lark-poker
+git clone https://github.com/gtoxlili/larkriver
+cd larkriver
 cp .env.example .env
 cargo run --release
 cargo test
@@ -150,12 +120,12 @@ cargo test
 把所有卡片样式发到 `ALLOWED_CHAT_ID` 看效果：
 
 ```bash
-./target/release/lark-poker --mock <你的 open_id>
+./target/release/larkriver --mock <你的 open_id>
 ```
 
 ## CI 和镜像
 
-每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/lark-poker:{latest, main, sha-<short>, v<semver>}`。
+每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/larkriver:{latest, main, sha-<short>, v<semver>}`。
 
 Dockerfile 用 cargo-chef 缓存依赖，distroless/cc-debian12:nonroot 作运行时，最终镜像约 30 MB。
 

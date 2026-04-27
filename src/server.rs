@@ -20,7 +20,7 @@ struct AppState {
 pub async fn run(bot: Arc<Bot>, addr: &str) -> Result<()> {
     let state = AppState { bot };
     let app = Router::new()
-        .route("/", get(|| async { "lark-poker bot" }))
+        .route("/", get(|| async { "larkriver bot" }))
         .route("/healthz", get(|| async { "ok" }))
         .route("/webhook/event", post(event_handler))
         .route("/webhook/card", post(card_handler))
