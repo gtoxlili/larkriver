@@ -203,6 +203,20 @@ impl Game {
         Ok(())
     }
 
+    /// Remove the most recently added AI seat. Returns the removed player's
+    /// display name. Refuses mid-hand to keep state consistent.
+    pub fn remove_last_ai(&mut self) -> Result<String> {
+        if !matches!(self.stage, Stage::Lobby | Stage::Ended) {
+            return Err(anyhow!("牌局进行中，无法移除 AI"));
+        }
+        let idx = self
+            .players
+            .iter()
+            .rposition(|p| p.is_ai)
+            .ok_or_else(|| anyhow!("桌上没有 AI 玩家"))?;
+        Ok(self.players.remove(idx).name)
+    }
+
     pub fn reset_table(&mut self) {
         self.players.clear();
         self.stage = Stage::Lobby;

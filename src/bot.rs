@@ -230,6 +230,17 @@ impl Bot {
         self.refresh_lobby(chat_id).await
     }
 
+    async fn do_remove_ai(&self, chat_id: &str) -> Result<()> {
+        {
+            let mut games = self.games.lock();
+            let game = games
+                .get_mut(chat_id)
+                .ok_or_else(|| anyhow!("当前没有牌局"))?;
+            let _removed = game.remove_last_ai()?;
+        }
+        self.refresh_lobby(chat_id).await
+    }
+
     async fn do_join_ai(&self, chat_id: &str) -> Result<()> {
         if self.llm.is_none() {
             return Err(anyhow!("机器人未配置 LLM (OPENAI_API_KEY 缺失)，无法加入 AI"));
@@ -241,8 +252,8 @@ impl Bot {
                 .or_insert_with(|| Game::new(chat_id.to_string()));
             // Number new AI seats sequentially per table.
             let n = game.players.iter().filter(|p| p.is_ai).count() + 1;
-            let ai_id = format!("ai:doubao:{}", n);
-            let ai_name = format!("豆包 #{}", n);
+            let ai_id = format!("ai:{}", n);
+            let ai_name = format!("AI #{}", n);
             game.add_ai_player(ai_id, ai_name)?;
         }
         self.refresh_lobby(chat_id).await
@@ -484,6 +495,7 @@ impl Bot {
                 | "start_lobby"
                 | "start_lobby_short"
                 | "join_ai_lobby"
+                | "remove_ai_lobby"
         ) {
             let bot = self.clone();
             let aid = action_id.clone();
@@ -503,6 +515,7 @@ impl Bot {
                     "start_lobby" => bot.do_start(&cid, DeckMode::Standard).await,
                     "start_lobby_short" => bot.do_start(&cid, DeckMode::ShortDeck).await,
                     "join_ai_lobby" => bot.do_join_ai(&cid).await,
+                    "remove_ai_lobby" => bot.do_remove_ai(&cid).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = res {
@@ -1513,6 +1526,13 @@ fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
                 merge(&v_base, &json!({ "action": "join_ai_lobby" })),
                 "default",
             ));
+            if snap.players.iter().any(|p| p.is_ai) {
+                buttons.push(button(
+                    "移除 AI",
+                    merge(&v_base, &json!({ "action": "remove_ai_lobby" })),
+                    "default",
+                ));
+            }
         }
         if !snap.players.is_empty() {
             buttons.push(button(

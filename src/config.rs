@@ -27,7 +27,7 @@ impl Config {
             openai_base_url: env_opt("OPENAI_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
             openai_model: env_opt("OPENAI_MODEL")
-                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
+                .unwrap_or_else(|| "deepseek-v4-flash".to_string()),
         })
     }
 }

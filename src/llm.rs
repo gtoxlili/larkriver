@@ -91,8 +91,10 @@ impl LlmClient {
                     .into(),
             ])
             .response_format(ResponseFormat::JsonObject)
-            .temperature(0.7)
-            .max_tokens(300u32)
+            // Casual chat-room poker — keep the model focused (low temperature)
+            // and the response short (decision JSON is < 100 tokens).
+            .temperature(0.4)
+            .max_tokens(150u32)
             .build()?;
 
         let response = self.client.chat().create(req).await?;
