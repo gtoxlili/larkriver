@@ -14,6 +14,7 @@ use crate::game::Persona;
 use crate::werewolf::cards::*;
 use crate::werewolf::game::*;
 use crate::werewolf::llm as wolf_llm;
+use crate::werewolf::llm::AttemptHistory;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -812,22 +813,67 @@ impl Bot {
                         }
                         return;
                     }
-                    // AI 守卫
-                    let target_idx = self.guard_ai_pick(chat_id, g_idx).await;
-                    let target_oid = {
-                        let games = self.wolf_games.lock();
-                        games
-                            .get(chat_id)
-                            .and_then(|g| g.players.get(target_idx).map(|p| p.open_id.clone()))
-                    };
-                    let Some(t) = target_oid else { return };
-                    {
+                    // AI 守卫：retry-with-feedback —— 每次失败把错误反馈给 AI 让它重选
+                    let mut history: AttemptHistory = vec![];
+                    let mut decided = false;
+                    for _attempt in 0..3 {
+                        let target_idx =
+                            self.guard_ai_pick(chat_id, g_idx, &history).await;
+                        let target_oid = {
+                            let games = self.wolf_games.lock();
+                            games.get(chat_id).and_then(|g| {
+                                g.players.get(target_idx).map(|p| p.open_id.clone())
+                            })
+                        };
+                        let target_oid = match target_oid {
+                            Some(t) => t,
+                            None => {
+                                history.push((
+                                    format!("{{\"target_idx\": {}}}", target_idx),
+                                    format!("idx {} 越界，玩家不存在", target_idx),
+                                ));
+                                continue;
+                            }
+                        };
+                        let result = {
+                            let mut games = self.wolf_games.lock();
+                            let Some(g) = games.get_mut(chat_id) else { return };
+                            let r = g.guard_pick(&g_oid, &target_oid);
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            r
+                        };
+                        match result {
+                            Ok(()) => { decided = true; break; }
+                            Err(e) => {
+                                history.push((
+                                    format!("{{\"target_idx\": {}}}", target_idx),
+                                    e.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if !decided {
+                        // AI 反复给非法答案 → 直接挑一个合法候选兜底，否则跳过 stage
                         let mut games = self.wolf_games.lock();
                         let Some(g) = games.get_mut(chat_id) else { return };
-                        if let Err(e) = g.guard_pick(&g_oid, &t) {
-                            warn!(?e, "AI guard_pick failed, falling back to self");
-                            // 退回到守自己
-                            let _ = g.guard_pick(&g_oid, &g_oid);
+                        let cands: Vec<String> = g
+                            .alive_indices()
+                            .into_iter()
+                            .filter(|i| g.last_guard_target != Some(*i))
+                            .map(|i| g.players[i].open_id.clone())
+                            .collect();
+                        let mut ok = false;
+                        for c in &cands {
+                            if g.guard_pick(&g_oid, c).is_ok() {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            warn!(%g_oid, "no legal guard target after AI retries, skipping");
+                            g.stage = Stage::WolvesPick;
                         }
                         self.persist_wolf_locked(chat_id, g);
                     }
@@ -932,17 +978,42 @@ impl Bot {
                             .collect()
                     };
                     for (idx, oid) in pending_ais {
-                        let target_idx = self.sheriff_vote_ai(chat_id, idx).await;
-                        let target_oid = target_idx.and_then(|t| {
-                            let games = self.wolf_games.lock();
-                            games
-                                .get(chat_id)
-                                .and_then(|g| g.players.get(t).map(|p| p.open_id.clone()))
-                        });
-                        {
+                        // retry-with-feedback：AI 投错就把错误反馈让它重选
+                        let mut hist: AttemptHistory = vec![];
+                        let mut decided = false;
+                        for _ in 0..3 {
+                            let target_opt = self.sheriff_vote_ai(chat_id, idx, &hist).await;
+                            let target_oid = target_opt.and_then(|t| {
+                                let games = self.wolf_games.lock();
+                                games.get(chat_id).and_then(|g| {
+                                    g.players.get(t).map(|p| p.open_id.clone())
+                                })
+                            });
+                            let result = {
+                                let mut games = self.wolf_games.lock();
+                                let Some(g) = games.get_mut(chat_id) else { return };
+                                let r = g.cast_sheriff_vote(&oid, target_oid.as_deref());
+                                if r.is_ok() {
+                                    self.persist_wolf_locked(chat_id, g);
+                                }
+                                r
+                            };
+                            match result {
+                                Ok(()) => { decided = true; break; }
+                                Err(e) => hist.push((
+                                    format!(
+                                        "{{\"target_idx\": {}}}",
+                                        target_opt.map(|i| i as i64).unwrap_or(-1)
+                                    ),
+                                    e.to_string(),
+                                )),
+                            }
+                        }
+                        if !decided {
+                            // 兜底：弃权
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.cast_sheriff_vote(&oid, target_oid.as_deref());
+                                let _ = g.cast_sheriff_vote(&oid, None);
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1021,23 +1092,53 @@ impl Bot {
                         }
                         return;
                     }
-                    // AI 警长
-                    let target_idx = self.badge_pass_ai(chat_id, h_idx).await;
-                    let target_oid = target_idx.and_then(|t| {
-                        let games = self.wolf_games.lock();
-                        games
-                            .get(chat_id)
-                            .and_then(|g| g.players.get(t).map(|p| p.open_id.clone()))
-                    });
-                    let new_holder = {
-                        let mut games = self.wolf_games.lock();
-                        let Some(g) = games.get_mut(chat_id) else { return };
-                        let r = g.transfer_badge(&h_oid, target_oid.as_deref());
-                        if r.is_ok() {
-                            self.persist_wolf_locked(chat_id, g);
+                    // AI 警长 retry-with-feedback
+                    let mut hist: AttemptHistory = vec![];
+                    let mut new_holder: Option<usize> = None;
+                    let mut decided = false;
+                    for _ in 0..3 {
+                        let target_opt = self.badge_pass_ai(chat_id, h_idx, &hist).await;
+                        let target_oid = target_opt.and_then(|t| {
+                            let games = self.wolf_games.lock();
+                            games.get(chat_id).and_then(|g| {
+                                g.players.get(t).map(|p| p.open_id.clone())
+                            })
+                        });
+                        let r = {
+                            let mut games = self.wolf_games.lock();
+                            let Some(g) = games.get_mut(chat_id) else { return };
+                            let r = g.transfer_badge(&h_oid, target_oid.as_deref());
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            r
+                        };
+                        match r {
+                            Ok(holder) => {
+                                new_holder = holder;
+                                decided = true;
+                                break;
+                            }
+                            Err(e) => hist.push((
+                                format!(
+                                    "{{\"target_idx\": {}}}",
+                                    target_opt.map(|i| i as i64).unwrap_or(-1)
+                                ),
+                                e.to_string(),
+                            )),
                         }
-                        r.ok().flatten()
-                    };
+                    }
+                    if !decided {
+                        // 兜底：撕毁警徽
+                        let mut games = self.wolf_games.lock();
+                        if let Some(g) = games.get_mut(chat_id) {
+                            let r = g.transfer_badge(&h_oid, None);
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            new_holder = r.ok().flatten();
+                        }
+                    }
                     let game = {
                         let games = self.wolf_games.lock();
                         games.get(chat_id).cloned()
@@ -1078,16 +1179,37 @@ impl Bot {
                                 .collect()
                         };
                         for (idx, open_id) in pending_ai_wolves {
-                            let decision = self.wolf_ai_pick(chat_id, idx, false).await;
-                            let target_open_id = {
-                                let games = self.wolf_games.lock();
-                                games.get(chat_id).and_then(|g| {
-                                    g.players.get(decision.target_idx).map(|p| p.open_id.clone())
-                                })
-                            };
-                            if let Some(t) = target_open_id {
-                                let _ = self.apply_wolf_kill(chat_id, &open_id, &t);
+                            // retry-with-feedback：AI 选错就给反馈让它重选
+                            let mut hist: AttemptHistory = vec![];
+                            for _ in 0..3 {
+                                let decision = self
+                                    .wolf_ai_pick(chat_id, idx, false, &hist)
+                                    .await;
+                                let target_open_id = {
+                                    let games = self.wolf_games.lock();
+                                    games.get(chat_id).and_then(|g| {
+                                        g.players.get(decision.target_idx).map(|p| p.open_id.clone())
+                                    })
+                                };
+                                let target_oid = match target_open_id {
+                                    Some(t) => t,
+                                    None => {
+                                        hist.push((
+                                            format!("{{\"target_idx\": {}}}", decision.target_idx),
+                                            format!("idx {} 越界", decision.target_idx),
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                match self.apply_wolf_kill(chat_id, &open_id, &target_oid) {
+                                    Ok(()) => break,
+                                    Err(e) => hist.push((
+                                        format!("{{\"target_idx\": {}}}", decision.target_idx),
+                                        e.to_string(),
+                                    )),
+                                }
                             }
+                            // 3 次都失败就跳过这只狼（这只狼无效投票）
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                         // 直接 advance（无需"我决定了"）
@@ -1132,28 +1254,67 @@ impl Bot {
                             .collect()
                     };
                     for (idx, open_id) in pending_ai_wolves {
-                        let decision = self.wolf_ai_pick(chat_id, idx, true).await;
-                        let target_open_id = {
-                            let games = self.wolf_games.lock();
-                            games.get(chat_id).and_then(|g| {
-                                g.players.get(decision.target_idx).map(|p| p.open_id.clone())
-                            })
-                        };
-                        if let Some(t) = target_open_id {
-                            let _ = self.apply_wolf_kill(chat_id, &open_id, &t);
+                        let mut hist: AttemptHistory = vec![];
+                        let mut chat_msg: Option<String> = None;
+                        let mut voted = false;
+                        for _ in 0..3 {
+                            let decision = self
+                                .wolf_ai_pick(chat_id, idx, true, &hist)
+                                .await;
+                            let target_open_id = {
+                                let games = self.wolf_games.lock();
+                                games.get(chat_id).and_then(|g| {
+                                    g.players.get(decision.target_idx).map(|p| p.open_id.clone())
+                                })
+                            };
+                            let target_oid = match target_open_id {
+                                Some(t) => t,
+                                None => {
+                                    hist.push((
+                                        format!("{{\"target_idx\": {}}}", decision.target_idx),
+                                        format!("idx {} 越界", decision.target_idx),
+                                    ));
+                                    continue;
+                                }
+                            };
+                            match self.apply_wolf_kill(chat_id, &open_id, &target_oid) {
+                                Ok(()) => {
+                                    chat_msg = decision.chat;
+                                    voted = true;
+                                    break;
+                                }
+                                Err(e) => hist.push((
+                                    format!("{{\"target_idx\": {}}}", decision.target_idx),
+                                    e.to_string(),
+                                )),
+                            }
                         }
-                        // AI 发言（如果 LLM 返回了）+ 自动就绪
+                        if !voted {
+                            // 兜底：随便挑一个合法目标投，避免这只 AI 永远不就绪
+                            let fallback = {
+                                let games = self.wolf_games.lock();
+                                games.get(chat_id).and_then(|g| {
+                                    g.players
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(i, p)| p.alive && !g.is_wolf(*i))
+                                        .map(|(_, p)| p.open_id.clone())
+                                })
+                            };
+                            if let Some(t) = fallback {
+                                let _ = self.apply_wolf_kill(chat_id, &open_id, &t);
+                            }
+                        }
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                if let Some(msg) = decision.chat {
+                                if let Some(msg) = chat_msg {
                                     let _ = g.wolf_say(&open_id, msg);
                                 }
                                 let _ = g.wolf_mark_ready(&open_id);
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        // 同步给所有狼的卡片
                         self.broadcast_wolf_night_update(chat_id).await;
                         tokio::time::sleep(Duration::from_millis(700)).await;
                     }
@@ -1211,23 +1372,64 @@ impl Bot {
                         return;
                     }
 
-                    // AI 预言家
-                    let target_idx = self.seer_ai_pick(chat_id, seer_idx).await;
-                    let target_oid = {
-                        let games = self.wolf_games.lock();
-                        games
-                            .get(chat_id)
-                            .and_then(|g| g.players.get(target_idx).map(|p| p.open_id.clone()))
-                    };
-                    let Some(target) = target_oid else { return };
-                    {
-                        let mut games = self.wolf_games.lock();
-                        let Some(g) = games.get_mut(chat_id) else { return };
-                        if let Err(e) = g.seer_check(&seer_oid, &target) {
-                            warn!(?e, "AI seer_check failed");
-                            return;
+                    // AI 预言家 retry-with-feedback
+                    let mut hist: AttemptHistory = vec![];
+                    let mut decided = false;
+                    for _ in 0..3 {
+                        let target_idx =
+                            self.seer_ai_pick(chat_id, seer_idx, &hist).await;
+                        let target_oid = {
+                            let games = self.wolf_games.lock();
+                            games.get(chat_id).and_then(|g| {
+                                g.players.get(target_idx).map(|p| p.open_id.clone())
+                            })
+                        };
+                        let target_oid = match target_oid {
+                            Some(t) => t,
+                            None => {
+                                hist.push((
+                                    format!("{{\"target_idx\": {}}}", target_idx),
+                                    format!("idx {} 越界", target_idx),
+                                ));
+                                continue;
+                            }
+                        };
+                        let r = {
+                            let mut games = self.wolf_games.lock();
+                            let Some(g) = games.get_mut(chat_id) else { return };
+                            let r = g.seer_check(&seer_oid, &target_oid);
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            r
+                        };
+                        match r {
+                            Ok(_) => { decided = true; break; }
+                            Err(e) => hist.push((
+                                format!("{{\"target_idx\": {}}}", target_idx),
+                                e.to_string(),
+                            )),
                         }
-                        self.persist_wolf_locked(chat_id, g);
+                    }
+                    if !decided {
+                        // 兜底：找一个非自己 alive 玩家查
+                        let fallback = {
+                            let games = self.wolf_games.lock();
+                            games.get(chat_id).and_then(|g| {
+                                g.players
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(i, p)| p.alive && *i != seer_idx)
+                                    .map(|(_, p)| p.open_id.clone())
+                            })
+                        };
+                        if let Some(t) = fallback {
+                            let mut games = self.wolf_games.lock();
+                            if let Some(g) = games.get_mut(chat_id) {
+                                let _ = g.seer_check(&seer_oid, &t);
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
@@ -1259,25 +1461,58 @@ impl Bot {
                         return;
                     }
 
-                    // AI 女巫
-                    let decision = self.witch_ai_decide(chat_id, witch_idx).await;
-                    {
-                        let mut games = self.wolf_games.lock();
-                        let Some(g) = games.get_mut(chat_id) else { return };
-                        let r = match decision {
-                            wolf_llm::WitchDecision::Save => g.witch_act(&witch_oid, true, None),
-                            wolf_llm::WitchDecision::Poison(idx) => {
-                                let target_oid = g.players[idx].open_id.clone();
-                                g.witch_act(&witch_oid, false, Some(&target_oid))
+                    // AI 女巫 retry-with-feedback
+                    let mut hist: AttemptHistory = vec![];
+                    let mut decided = false;
+                    for _ in 0..3 {
+                        let decision =
+                            self.witch_ai_decide(chat_id, witch_idx, &hist).await;
+                        let r = {
+                            let mut games = self.wolf_games.lock();
+                            let Some(g) = games.get_mut(chat_id) else { return };
+                            let r = match &decision {
+                                wolf_llm::WitchDecision::Save => {
+                                    g.witch_act(&witch_oid, true, None)
+                                }
+                                wolf_llm::WitchDecision::Poison(idx) => {
+                                    let target_oid = g.players[*idx].open_id.clone();
+                                    g.witch_act(&witch_oid, false, Some(&target_oid))
+                                }
+                                wolf_llm::WitchDecision::Skip => {
+                                    g.witch_act(&witch_oid, false, None)
+                                }
+                            };
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
                             }
-                            wolf_llm::WitchDecision::Skip => g.witch_act(&witch_oid, false, None),
+                            r
                         };
-                        if let Err(e) = r {
-                            warn!(?e, "AI witch_act failed");
-                            // 自动跳过避免死锁
-                            let _ = g.witch_act(&witch_oid, false, None);
+                        match r {
+                            Ok(()) => { decided = true; break; }
+                            Err(e) => {
+                                let answer_repr = match &decision {
+                                    wolf_llm::WitchDecision::Save => {
+                                        "{\"action\": \"save\"}".to_string()
+                                    }
+                                    wolf_llm::WitchDecision::Poison(idx) => format!(
+                                        "{{\"action\": \"poison\", \"poison_target_idx\": {}}}",
+                                        idx
+                                    ),
+                                    wolf_llm::WitchDecision::Skip => {
+                                        "{\"action\": \"skip\"}".to_string()
+                                    }
+                                };
+                                hist.push((answer_repr, e.to_string()));
+                            }
                         }
-                        self.persist_wolf_locked(chat_id, g);
+                    }
+                    if !decided {
+                        // 兜底：跳过
+                        let mut games = self.wolf_games.lock();
+                        if let Some(g) = games.get_mut(chat_id) {
+                            let _ = g.witch_act(&witch_oid, false, None);
+                            self.persist_wolf_locked(chat_id, g);
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
@@ -1546,33 +1781,48 @@ impl Bot {
                             .collect()
                     };
                     for (idx, oid) in pending_ais {
-                        let decision = self.vote_ai_pick(chat_id, idx).await;
-                        let (target_oid, name, persona) = {
-                            let games = self.wolf_games.lock();
-                            let Some(g) = games.get(chat_id) else { return };
-                            let p = &g.players[idx];
-                            let t = decision
-                                .target_idx
-                                .and_then(|t| g.players.get(t))
-                                .map(|p| p.open_id.clone());
-                            (t, p.name.clone(), p.persona)
-                        };
-                        {
+                        // 投票 retry-with-feedback；不再带 quip
+                        let mut hist: AttemptHistory = vec![];
+                        let mut decided = false;
+                        for _ in 0..3 {
+                            let decision = self.vote_ai_pick(chat_id, idx, &hist).await;
+                            let target_oid = {
+                                let games = self.wolf_games.lock();
+                                let Some(g) = games.get(chat_id) else { return };
+                                decision
+                                    .target_idx
+                                    .and_then(|t| g.players.get(t))
+                                    .map(|p| p.open_id.clone())
+                            };
+                            let r = {
+                                let mut games = self.wolf_games.lock();
+                                let Some(g) = games.get_mut(chat_id) else { return };
+                                let r = g.cast_vote(&oid, target_oid.as_deref());
+                                if r.is_ok() {
+                                    self.persist_wolf_locked(chat_id, g);
+                                }
+                                r
+                            };
+                            match r {
+                                Ok(()) => { decided = true; break; }
+                                Err(e) => hist.push((
+                                    format!(
+                                        "{{\"target_idx\": {}}}",
+                                        decision.target_idx.map(|i| i as i64).unwrap_or(-1)
+                                    ),
+                                    e.to_string(),
+                                )),
+                            }
+                        }
+                        if !decided {
+                            // 兜底：弃权
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.cast_vote(&oid, target_oid.as_deref());
+                                let _ = g.cast_vote(&oid, None);
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        if let Some(q) = decision.quip {
-                            let emoji = persona.map(|p| p.emoji()).unwrap_or("💬");
-                            let post = build_ai_quip_post(emoji, &name, &q);
-                            let _ = self
-                                .client
-                                .send_message("chat_id", chat_id, "post", &post)
-                                .await;
-                        }
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
                     }
 
                     // 2. 是否所有人都投了？
@@ -1672,23 +1922,53 @@ impl Bot {
                         return;
                     }
 
-                    // AI 猎人
-                    let target_idx = self.hunter_ai_pick(chat_id, h_idx).await;
-                    let target_oid = target_idx.and_then(|t| {
-                        let games = self.wolf_games.lock();
-                        games
-                            .get(chat_id)
-                            .and_then(|g| g.players.get(t).map(|p| p.open_id.clone()))
-                    });
-                    let shot_idx = {
-                        let mut games = self.wolf_games.lock();
-                        let Some(g) = games.get_mut(chat_id) else { return };
-                        let r = g.hunter_shoot(&h_oid, target_oid.as_deref());
-                        if r.is_ok() {
-                            self.persist_wolf_locked(chat_id, g);
+                    // AI 猎人 retry-with-feedback
+                    let mut hist: AttemptHistory = vec![];
+                    let mut shot_idx: Option<usize> = None;
+                    let mut decided = false;
+                    for _ in 0..3 {
+                        let target_opt = self.hunter_ai_pick(chat_id, h_idx, &hist).await;
+                        let target_oid = target_opt.and_then(|t| {
+                            let games = self.wolf_games.lock();
+                            games.get(chat_id).and_then(|g| {
+                                g.players.get(t).map(|p| p.open_id.clone())
+                            })
+                        });
+                        let r = {
+                            let mut games = self.wolf_games.lock();
+                            let Some(g) = games.get_mut(chat_id) else { return };
+                            let r = g.hunter_shoot(&h_oid, target_oid.as_deref());
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            r
+                        };
+                        match r {
+                            Ok(s) => {
+                                shot_idx = s;
+                                decided = true;
+                                break;
+                            }
+                            Err(e) => hist.push((
+                                format!(
+                                    "{{\"target_idx\": {}}}",
+                                    target_opt.map(|i| i as i64).unwrap_or(-1)
+                                ),
+                                e.to_string(),
+                            )),
                         }
-                        r.ok().flatten()
-                    };
+                    }
+                    if !decided {
+                        // 兜底：不开枪
+                        let mut games = self.wolf_games.lock();
+                        if let Some(g) = games.get_mut(chat_id) {
+                            let r = g.hunter_shoot(&h_oid, None);
+                            if r.is_ok() {
+                                self.persist_wolf_locked(chat_id, g);
+                            }
+                            shot_idx = r.ok().flatten();
+                        }
+                    }
                     let game = {
                         let games = self.wolf_games.lock();
                         games.get(chat_id).cloned()
@@ -1740,7 +2020,11 @@ impl Bot {
                 return;
             }
         }
-        warn!("advance_wolf hit iteration limit");
+        let stuck_stage = {
+            let games = self.wolf_games.lock();
+            games.get(chat_id).map(|g| g.stage)
+        };
+        warn!(?stuck_stage, %chat_id, "advance_wolf hit iteration limit");
     }
 
     // ========================================================================
@@ -1753,6 +2037,7 @@ impl Bot {
         chat_id: &str,
         ai_idx: usize,
         speak_enabled: bool,
+        history: &AttemptHistory,
     ) -> wolf_llm::WolfPickDecision {
         let game = {
             let games = self.wolf_games.lock();
@@ -1763,7 +2048,7 @@ impl Bot {
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::wolf_pick(llm, &view, &game, speak_enabled).await,
+            Some(llm) => wolf_llm::wolf_pick(llm, &view, &game, speak_enabled, history).await,
             None => {
                 // fallback: 选第一个非狼存活
                 let target_idx = game
@@ -1831,7 +2116,12 @@ impl Bot {
         }
     }
 
-    async fn seer_ai_pick(&self, chat_id: &str, ai_idx: usize) -> usize {
+    async fn seer_ai_pick(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> usize {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
@@ -1839,7 +2129,7 @@ impl Bot {
         let Some(game) = game else { return 0 };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::seer_pick(llm, &view).await,
+            Some(llm) => wolf_llm::seer_pick(llm, &view, history).await,
             None => game
                 .players
                 .iter()
@@ -1850,7 +2140,12 @@ impl Bot {
         }
     }
 
-    async fn witch_ai_decide(&self, chat_id: &str, ai_idx: usize) -> wolf_llm::WitchDecision {
+    async fn witch_ai_decide(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> wolf_llm::WitchDecision {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
@@ -1860,27 +2155,37 @@ impl Bot {
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::witch_decide(llm, &view, &game).await,
+            Some(llm) => wolf_llm::witch_decide(llm, &view, &game, history).await,
             None => wolf_llm::WitchDecision::Skip,
         }
     }
 
-    async fn vote_ai_pick(&self, chat_id: &str, ai_idx: usize) -> wolf_llm::VoteDecision {
+    async fn vote_ai_pick(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> wolf_llm::VoteDecision {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
         };
         let Some(game) = game else {
-            return wolf_llm::VoteDecision { target_idx: None, quip: None };
+            return wolf_llm::VoteDecision { target_idx: None };
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::vote_pick(llm, &view).await,
-            None => wolf_llm::VoteDecision { target_idx: None, quip: None },
+            Some(llm) => wolf_llm::vote_pick(llm, &view, history).await,
+            None => wolf_llm::VoteDecision { target_idx: None },
         }
     }
 
-    async fn hunter_ai_pick(&self, chat_id: &str, ai_idx: usize) -> Option<usize> {
+    async fn hunter_ai_pick(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> Option<usize> {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
@@ -1888,7 +2193,7 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::hunter_pick(llm, &view).await,
+            Some(llm) => wolf_llm::hunter_pick(llm, &view, history).await,
             None => None,
         }
     }
@@ -2194,7 +2499,12 @@ impl Bot {
         }
     }
 
-    async fn guard_ai_pick(&self, chat_id: &str, ai_idx: usize) -> usize {
+    async fn guard_ai_pick(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> usize {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
@@ -2202,7 +2512,7 @@ impl Bot {
         let Some(game) = game else { return ai_idx };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::guard_pick(llm, &view, &game).await,
+            Some(llm) => wolf_llm::guard_pick(llm, &view, &game, history).await,
             None => {
                 // fallback：守自己（如果上夜没守过自己）；否则任意非昨守目标
                 if game.last_guard_target != Some(ai_idx) {
@@ -2231,7 +2541,12 @@ impl Bot {
         }
     }
 
-    async fn sheriff_vote_ai(&self, chat_id: &str, ai_idx: usize) -> Option<usize> {
+    async fn sheriff_vote_ai(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> Option<usize> {
         let (game, candidates) = {
             let games = self.wolf_games.lock();
             let g = games.get(chat_id).cloned();
@@ -2249,12 +2564,17 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_vote(llm, &view, &candidates).await,
+            Some(llm) => wolf_llm::sheriff_vote(llm, &view, &candidates, history).await,
             None => candidates.first().map(|(i, _)| *i),
         }
     }
 
-    async fn badge_pass_ai(&self, chat_id: &str, ai_idx: usize) -> Option<usize> {
+    async fn badge_pass_ai(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+        history: &AttemptHistory,
+    ) -> Option<usize> {
         let game = {
             let games = self.wolf_games.lock();
             games.get(chat_id).cloned()
@@ -2262,7 +2582,7 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::badge_pass(llm, &view).await,
+            Some(llm) => wolf_llm::badge_pass(llm, &view, history).await,
             None => None,
         }
     }

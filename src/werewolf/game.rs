@@ -386,6 +386,49 @@ pub struct WolfGame {
 
     /// 死亡日志（结构化），结算时显示。
     pub deaths: Vec<DeathEvent>,
+
+    /// 结构化复盘日志：所有关键事件按发生顺序追加，结算 summary 时分组渲染。
+    /// 与 event_log（自然语言文本，给 AI prompt 用）平行存在。
+    #[serde(default)]
+    pub recap_log: Vec<RecapEvent>,
+}
+
+/// 复盘卡片要展示的所有结构化事件类型。游戏过程中按发生顺序追加到
+/// `WolfGame::recap_log`，结算时按天 / 夜 / 类型分组渲染。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RecapEvent {
+    /// 守卫守护
+    GuardProtect { day: u32, target: usize },
+    /// 狼人最终合议击杀目标（None = 空刀）
+    WolfFinalTarget { day: u32, target: Option<usize> },
+    /// 预言家查验
+    SeerCheck { day: u32, target: usize, is_wolf: bool },
+    /// 女巫行动 (save = true 表示救了今晚的猎物；poison = Some(idx) 表示毒了谁)
+    Witch { day: u32, save: bool, poison: Option<usize> },
+    /// 死亡（含死因）
+    Death { day: u32, night: bool, player: usize, cause: DeathCause },
+    /// 死亡遗言
+    LastWords { day: u32, night: bool, player: usize, text: String },
+    /// 上警候选人公告
+    SheriffCandidates { candidates: Vec<usize> },
+    /// 上警发言（候选人）
+    SheriffSpeech { player: usize, text: String },
+    /// 警下发言（非候选人）
+    SheriffSideSpeech { player: usize, text: String },
+    /// 警长当选（None = 流局）
+    SheriffElected { player: Option<usize> },
+    /// 警长选起手方向（true = 警上 / 顺时针）
+    SheriffDirection { clockwise: bool },
+    /// 白天轮流发言
+    DaySpeech { day: u32, player: usize, text: String },
+    /// 单条投票（含权重，警长 = 3，普通 = 2）
+    DayVoteCast { day: u32, voter: usize, target: Option<usize>, weight: u32 },
+    /// 当天放逐结果（None = 平票 / 全弃权流局）
+    DayLynch { day: u32, target: Option<usize> },
+    /// 猎人 / 狼王开枪
+    HunterShot { day: u32, shooter: usize, target: Option<usize> },
+    /// 警徽流转（to = None 表示撕毁）
+    BadgePass { day: u32, from: usize, to: Option<usize> },
 }
 
 impl WolfGame {
@@ -445,6 +488,7 @@ impl WolfGame {
             pending_hunter_post_stage: None,
             event_log: vec![],
             deaths: vec![],
+            recap_log: vec![],
         }
     }
 
@@ -621,6 +665,7 @@ impl WolfGame {
         self.pending_hunter_post_stage = None;
         self.event_log.clear();
         self.deaths.clear();
+        self.recap_log.clear();
 
         // 第一夜起点：有守卫先守卫，否则狼。
         self.stage = if self.role_idx(Role::Guard).is_some() {
@@ -657,6 +702,7 @@ impl WolfGame {
         }
         self.guard_target = Some(t_idx);
         self.last_guard_target = Some(t_idx);
+        self.recap_log.push(RecapEvent::GuardProtect { day: self.day, target: t_idx });
         // 守卫完成 → 进入狼人阶段
         self.stage = Stage::WolvesPick;
         Ok(())
@@ -802,6 +848,10 @@ impl WolfGame {
             return Err(anyhow!("当前不是狼人阶段"));
         }
         self.resolve_wolf_kill();
+        self.recap_log.push(RecapEvent::WolfFinalTarget {
+            day: self.day,
+            target: self.night_victim,
+        });
         // 进入下一阶段
         self.next_night_stage_after(Stage::WolvesPick);
         Ok(())
@@ -832,6 +882,11 @@ impl WolfGame {
         self.seer_history.push(SeerCheck {
             day: self.day,
             target_idx: t_idx,
+            is_wolf,
+        });
+        self.recap_log.push(RecapEvent::SeerCheck {
+            day: self.day,
+            target: t_idx,
             is_wolf,
         });
         // 进入下一阶段（女巫或白天）
@@ -883,6 +938,11 @@ impl WolfGame {
         self.witch_save_choice = Some(save_victim);
         self.witch_poison_target = poison_idx;
         self.witch_acted = true;
+        self.recap_log.push(RecapEvent::Witch {
+            day: self.day,
+            save: save_victim,
+            poison: poison_idx,
+        });
         self.next_night_stage_after(Stage::WitchAct);
         Ok(())
     }
@@ -930,6 +990,12 @@ impl WolfGame {
                 day: self.day,
                 night: true,
                 player_idx: *idx,
+                cause: *cause,
+            });
+            self.recap_log.push(RecapEvent::Death {
+                day: self.day,
+                night: true,
+                player: *idx,
                 cause: *cause,
             });
             self.event_log.push(format!(
@@ -1114,6 +1180,7 @@ impl WolfGame {
             self.players[idx].name,
             if clockwise { "警上 (顺时针)" } else { "警下 (逆时针)" }
         ));
+        self.recap_log.push(RecapEvent::SheriffDirection { clockwise });
         self.stage = Stage::DaySpeech;
         Ok(())
     }
@@ -1148,6 +1215,11 @@ impl WolfGame {
             "第 {} 天 · {} 发言：{}",
             self.day, self.players[idx].name, display
         ));
+        self.recap_log.push(RecapEvent::DaySpeech {
+            day: self.day,
+            player: idx,
+            text: display.clone(),
+        });
         self.day_speeches.push((idx, display));
         self.day_speech_idx += 1;
         // 切换发言人 → 旧的私发卡作废（caller 应避免错发）
@@ -1203,9 +1275,13 @@ impl WolfGame {
             return Err(anyhow!("当前不是上警阶段"));
         }
         let candidates = self.sheriff_candidates();
+        self.recap_log.push(RecapEvent::SheriffCandidates {
+            candidates: candidates.clone(),
+        });
         match candidates.len() {
             0 => {
                 self.event_log.push("无人上警，本局无警长。".to_string());
+                self.recap_log.push(RecapEvent::SheriffElected { player: None });
                 self.start_day_speech();
             }
             1 => {
@@ -1215,6 +1291,7 @@ impl WolfGame {
                     "{} 唯一上警，自动当选警长。",
                     self.players[only].name
                 ));
+                self.recap_log.push(RecapEvent::SheriffElected { player: Some(only) });
                 self.start_day_speech();
             }
             _ => {
@@ -1259,6 +1336,10 @@ impl WolfGame {
             "上警发言 · {}：{}",
             self.players[idx].name, display
         ));
+        self.recap_log.push(RecapEvent::SheriffSpeech {
+            player: idx,
+            text: display.clone(),
+        });
         self.sheriff_speeches.push((idx, display));
         self.sheriff_speech_idx += 1;
         self.sheriff_speech_private_msg = None;
@@ -1332,6 +1413,10 @@ impl WolfGame {
             "警下发言 · {}：{}",
             self.players[idx].name, display
         ));
+        self.recap_log.push(RecapEvent::SheriffSideSpeech {
+            player: idx,
+            text: display.clone(),
+        });
         self.sheriff_side_speeches.push((idx, display));
         self.sheriff_side_idx += 1;
         self.sheriff_side_private_msg = None;
@@ -1386,6 +1471,14 @@ impl WolfGame {
             "{} 的遗言：{}",
             self.players[idx].name, display
         ));
+        // 区分夜晚遗言（在 LastWords post=DayReveal 时）vs 放逐遗言（post=DayVote）
+        let night = matches!(self.last_words_post_stage, Some(Stage::DayReveal));
+        self.recap_log.push(RecapEvent::LastWords {
+            day: self.day,
+            night,
+            player: idx,
+            text: display.clone(),
+        });
         self.last_words_speeches.push((idx, display));
         self.last_words_idx += 1;
         self.last_words_private_msg = None;
@@ -1486,6 +1579,7 @@ impl WolfGame {
         if tally.is_empty() {
             self.event_log
                 .push("警长投票全员弃权，本局无警长。".to_string());
+            self.recap_log.push(RecapEvent::SheriffElected { player: None });
             self.start_day_speech();
             return Ok(None);
         }
@@ -1498,6 +1592,7 @@ impl WolfGame {
         if top.len() > 1 {
             self.event_log
                 .push("警长投票平票，本局无警长。".to_string());
+            self.recap_log.push(RecapEvent::SheriffElected { player: None });
             self.start_day_speech();
             return Ok(None);
         }
@@ -1505,6 +1600,7 @@ impl WolfGame {
         self.sheriff_idx = Some(elected);
         self.event_log
             .push(format!("{} 当选警长。", self.players[elected].name));
+        self.recap_log.push(RecapEvent::SheriffElected { player: Some(elected) });
         self.start_day_speech();
         Ok(Some(elected))
     }
@@ -1556,6 +1652,11 @@ impl WolfGame {
                 .push(format!("{} 撕毁警徽", self.players[s_idx].name));
             None
         };
+        self.recap_log.push(RecapEvent::BadgePass {
+            day: self.day,
+            from: s_idx,
+            to: new_holder,
+        });
         // 移交完毕，回到 pending_badge_post_stage 指定的阶段
         let next = self.pending_badge_post_stage.take();
         self.pending_badge = None;
@@ -1615,6 +1716,13 @@ impl WolfGame {
             None
         };
         self.day_votes.cast(v_idx, t_idx);
+        let weight = self.vote_weight(v_idx);
+        self.recap_log.push(RecapEvent::DayVoteCast {
+            day: self.day,
+            voter: v_idx,
+            target: t_idx,
+            weight,
+        });
         Ok(())
     }
 
@@ -1645,6 +1753,7 @@ impl WolfGame {
             self.last_day_lynched = None;
             self.event_log
                 .push(format!("第 {} 天：全员弃权，无人放逐。", self.day));
+            self.recap_log.push(RecapEvent::DayLynch { day: self.day, target: None });
             return Ok(None);
         }
         let max = tally.iter().map(|(_, c)| *c).max().unwrap_or(0);
@@ -1657,6 +1766,7 @@ impl WolfGame {
             self.last_day_lynched = None;
             self.event_log
                 .push(format!("第 {} 天：投票平票，无人放逐。", self.day));
+            self.recap_log.push(RecapEvent::DayLynch { day: self.day, target: None });
             return Ok(None);
         }
         let lynched = top[0];
@@ -1668,10 +1778,20 @@ impl WolfGame {
             player_idx: lynched,
             cause: DeathCause::Lynch,
         });
+        self.recap_log.push(RecapEvent::Death {
+            day: self.day,
+            night: false,
+            player: lynched,
+            cause: DeathCause::Lynch,
+        });
         self.event_log.push(format!(
             "第 {} 天：{} 被投票放逐。",
             self.day, self.players[lynched].name
         ));
+        self.recap_log.push(RecapEvent::DayLynch {
+            day: self.day,
+            target: Some(lynched),
+        });
         Ok(Some(lynched))
     }
 
@@ -1729,10 +1849,17 @@ impl WolfGame {
                 return Err(anyhow!("不能枪杀自己"));
             }
             self.players[t].alive = false;
+            let night = matches!(self.pending_hunter_post_stage, Some(Stage::DayReveal));
             self.deaths.push(DeathEvent {
                 day: self.day,
-                night: matches!(self.pending_hunter_post_stage, Some(Stage::DayReveal)),
+                night,
                 player_idx: t,
+                cause: DeathCause::HunterShot,
+            });
+            self.recap_log.push(RecapEvent::Death {
+                day: self.day,
+                night,
+                player: t,
                 cause: DeathCause::HunterShot,
             });
             self.event_log.push(format!(
@@ -1744,6 +1871,11 @@ impl WolfGame {
             self.event_log
                 .push(format!("猎人 {} 选择不开枪", self.players[h_idx].name));
         }
+        self.recap_log.push(RecapEvent::HunterShot {
+            day: self.day,
+            shooter: h_idx,
+            target: shot_idx,
+        });
 
         // 把夜里的死亡加到 last_night_deaths（用于白天广播）
         let post = self.pending_hunter_post_stage.take();
@@ -1808,15 +1940,33 @@ impl WolfGame {
     }
 
     /// 胜负检查。
+    ///
+    /// **屠城规则 + 警长例外**：
+    /// - 全部狼死 → 好人胜
+    /// - 狼数 > 好人数 → 狼胜（绝对多数）
+    /// - 狼数 == 好人数：
+    ///   - 警长存活且是好人 → 不算狼胜（1.5x 票权能压回，游戏继续）
+    ///   - 否则 → 狼胜
     pub fn victory(&self) -> Option<Winner> {
         let wolves = self.alive_wolf_count();
         let good = self.alive_good_count();
         if wolves == 0 {
             return Some(Winner::Good);
         }
-        // 屠城：狼数 ≥ 好人数 时狼胜（狼进入多数派）
-        if wolves >= good {
+        if wolves > good {
             return Some(Winner::Wolves);
+        }
+        if wolves == good {
+            // 警长还在好人手上 → 1.5x 票权使好人在投票中占优
+            // 例如 1:1 时好人警长（3 权）vs 狼（2 权）→ 狼会被投出
+            let sheriff_protects = self
+                .sheriff_idx
+                .filter(|s| self.players[*s].alive)
+                .map(|s| !self.is_wolf(s))
+                .unwrap_or(false);
+            if !sheriff_protects {
+                return Some(Winner::Wolves);
+            }
         }
         None
     }
@@ -1949,6 +2099,37 @@ mod tests {
         assert!(Role::WolfKing.is_wolf());
         assert!(Role::Werewolf.is_wolf());
         assert!(!Role::Seer.is_wolf());
+    }
+
+    #[test]
+    fn recap_log_captures_night_actions() {
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+
+        g.wolf_pick("p0", "p8").unwrap();
+        g.wolf_pick("p1", "p8").unwrap();
+        g.wolf_pick("p2", "p8").unwrap();
+        g.advance_after_wolves().unwrap();
+        g.seer_check("p3", "p0").unwrap();
+        g.witch_act("p4", false, None).unwrap();
+
+        // 应当至少包含：WolfFinalTarget(P8), SeerCheck(P0=狼), Witch(skip), Death(P8 wolf-kill)
+        assert!(matches!(
+            g.recap_log.iter().find(|e| matches!(e, RecapEvent::WolfFinalTarget { target: Some(8), .. })),
+            Some(_)
+        ));
+        assert!(matches!(
+            g.recap_log.iter().find(|e| matches!(e, RecapEvent::SeerCheck { target: 0, is_wolf: true, .. })),
+            Some(_)
+        ));
+        assert!(matches!(
+            g.recap_log.iter().find(|e| matches!(e, RecapEvent::Witch { save: false, poison: None, .. })),
+            Some(_)
+        ));
+        assert!(matches!(
+            g.recap_log.iter().find(|e| matches!(e, RecapEvent::Death { player: 8, cause: DeathCause::WolfKill, .. })),
+            Some(_)
+        ));
     }
 
     #[test]
@@ -2491,6 +2672,7 @@ mod tests {
 
     #[test]
     fn victory_when_wolves_outnumber() {
+        // 2 狼 vs 1 好人 (绝对多数) → 狼胜，无关警长
         let mut g = make_n(9);
         lock_roles_9(&mut g);
         g.players[2].alive = false;
@@ -2499,6 +2681,69 @@ mod tests {
         }
         assert_eq!(g.alive_wolf_count(), 2);
         assert_eq!(g.alive_good_count(), 1);
+        assert_eq!(g.victory(), Some(Winner::Wolves));
+    }
+
+    #[test]
+    fn victory_at_parity_no_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，无警长 → 狼胜（屠城，1.5x 不存在）
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        // 杀掉 P1 P2（其他 2 狼）+ P3-7（5 个好人），剩 P0 狼 + P8 好人
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        assert_eq!(g.alive_wolf_count(), 1);
+        assert_eq!(g.alive_good_count(), 1);
+        assert!(g.sheriff_idx.is_none());
+        assert_eq!(g.victory(), Some(Winner::Wolves));
+    }
+
+    #[test]
+    fn victory_at_parity_with_good_sheriff_continues() {
+        // 1 狼 vs 1 好人，警长是好人 → 不算狼胜（1.5x 票权能压回）
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        // P8 (好人村民) 是警长
+        g.sheriff_idx = Some(8);
+        assert_eq!(g.alive_wolf_count(), 1);
+        assert_eq!(g.alive_good_count(), 1);
+        assert_eq!(g.victory(), None, "好人警长在场时 1:1 不算狼胜");
+    }
+
+    #[test]
+    fn victory_at_parity_with_dead_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，警长已死 → 狼胜
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        // P3 曾是警长，但已死
+        g.sheriff_idx = Some(3);
+        assert_eq!(g.victory(), Some(Winner::Wolves));
+    }
+
+    #[test]
+    fn victory_at_parity_with_wolf_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，警长在狼身上 → 狼胜（狼也享受 1.5x，更乱）
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        g.sheriff_idx = Some(0); // P0 是狼且是警长
         assert_eq!(g.victory(), Some(Winner::Wolves));
     }
 }

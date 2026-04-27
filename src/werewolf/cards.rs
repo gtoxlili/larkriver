@@ -975,31 +975,24 @@ pub fn build_hunter_card(game: &WolfGame, viewer: &Player) -> Value {
     )
 }
 
-/// 公开广播：猎人 / 狼王开枪打死了谁，或选择不开枪。开枪事件会公开角色。
+/// 公开广播：临死前开枪打死了谁，或选择不开枪。
+///
+/// **不公开角色**——猎人和狼王共享开枪技能，狼王惯例伪装成猎人，所以这里
+/// 用中性标题 "🏹 开枪"，不写"狼王开枪"也不直接断言"猎人开枪"。真身在结算
+/// summary 卡才揭晓。
 pub fn build_hunter_announce_card(
     shooter: &Player,
     target: Option<&Player>,
 ) -> Value {
-    let (title, role_emoji, role_label) = match shooter.role {
-        Some(Role::WolfKing) => ("👑 狼王开枪", "👑", "狼王"),
-        _ => ("🏹 猎人开枪", "🏹", "猎人"),
-    };
     let body = match target {
         Some(t) => format!(
-            "{} {} ({}) 临死前开枪，带走了 {}",
-            role_emoji,
+            "🏹 {} 临死前开枪，带走了 {}",
             display_name(shooter),
-            role_label,
             display_name(t),
         ),
-        None => format!(
-            "{} {} ({}) 选择不开枪",
-            role_emoji,
-            display_name(shooter),
-            role_label
-        ),
+        None => format!("🏹 {} 选择不开枪", display_name(shooter)),
     };
-    card(header(title, "carmine"), vec![markdown(&body)])
+    card(header("🏹 开枪", "carmine"), vec![markdown(&body)])
 }
 
 // ============================================================================
@@ -1073,6 +1066,9 @@ pub fn build_summary_card(game: &WolfGame, winner: Winner) -> Value {
         Winner::Wolves => "carmine",
     };
 
+    let mut elements: Vec<Value> = vec![];
+
+    // 1. 真身揭晓
     let role_lines: Vec<String> = game
         .players
         .iter()
@@ -1085,28 +1081,16 @@ pub fn build_summary_card(game: &WolfGame, winner: Winner) -> Value {
             format!("• {} — **{}** · {}", display_name(p), r, alive)
         })
         .collect();
+    elements.push(markdown(&format!("**真身揭晓：**\n{}", role_lines.join("\n"))));
 
-    let mut elements = vec![
-        markdown(&format!("**真身揭晓：**\n{}", role_lines.join("\n"))),
-    ];
-
-    if !game.deaths.is_empty() {
-        let mut dlines: Vec<String> = vec![];
-        for d in &game.deaths {
-            let phase = if d.night {
-                format!("第 {} 夜", d.day)
-            } else {
-                format!("第 {} 天", d.day)
-            };
-            dlines.push(format!(
-                "• {} · {} · {}",
-                phase,
-                game.players[d.player_idx].name,
-                d.cause.label()
-            ));
-        }
+    // 2. 全局复盘：按天 / 阶段渲染
+    let recap_md = render_recap(game);
+    if !recap_md.is_empty() {
         elements.push(hr());
-        elements.push(markdown(&format!("**死亡时间线：**\n{}", dlines.join("\n"))));
+        elements.push(markdown("**🎬 全局复盘**"));
+        for chunk in recap_md {
+            elements.push(markdown(&chunk));
+        }
     }
 
     elements.push(note("点大厅卡的 [开局] 开下一局"));
@@ -1121,20 +1105,180 @@ pub fn build_summary_card(game: &WolfGame, winner: Winner) -> Value {
     )
 }
 
-// ============================================================================
-// AI 公开发言（quip）
-// ============================================================================
+/// 把 `recap_log` 渲染成多个 markdown 段落（按天/阶段切块），交给 caller 拼到卡上。
+/// 切多块是为了避免单条 markdown 超长——飞书卡片对单 element 长度有限制。
+fn render_recap(game: &WolfGame) -> Vec<String> {
+    use crate::werewolf::game::RecapEvent as E;
 
-/// AI 发言用的"post"富文本消息，与德州的 quip 渲染一致。
-pub fn build_ai_quip_post(persona_emoji: &str, ai_name: &str, quip: &str) -> Value {
-    json!({
-        "zh_cn": {
-            "title": "",
-            "content": [[
-                { "tag": "text", "text": format!("{persona_emoji} ") },
-                { "tag": "text", "text": ai_name, "style": ["bold"] },
-                { "tag": "text", "text": format!("：{quip}") },
-            ]]
+    let name = |idx: usize| -> &str {
+        game.players.get(idx).map(|p| p.name.as_str()).unwrap_or("?")
+    };
+
+    // 把 recap_log 按"段"分组：每段对应一个标题块（例如 第 N 夜 / 第 N 天 黎明 /
+    // 上警 / 第 N 天 发言 / 第 N 天 投票）。
+    enum Section {
+        Night(u32),
+        Dawn(u32),
+        Sheriff,
+        DaySpeech(u32),
+        DayVote(u32),
+        Skill,
+    }
+    impl Section {
+        fn title(&self) -> String {
+            match self {
+                Section::Night(d) => format!("🌒 **第 {d} 夜**"),
+                Section::Dawn(d) => format!("🌅 **第 {d} 天 黎明**"),
+                Section::Sheriff => "🎖️ **上警阶段**".into(),
+                Section::DaySpeech(d) => format!("🎙️ **第 {d} 天 轮流发言**"),
+                Section::DayVote(d) => format!("🗳️ **第 {d} 天 投票**"),
+                Section::Skill => "🏹 **技能 · 警徽流转**".into(),
+            }
         }
-    })
+    }
+
+    fn classify(event: &crate::werewolf::game::RecapEvent) -> Section {
+        match event {
+            E::GuardProtect { day, .. }
+            | E::WolfFinalTarget { day, .. }
+            | E::SeerCheck { day, .. }
+            | E::Witch { day, .. } => Section::Night(*day),
+            E::Death { day, night: true, .. } | E::LastWords { day, night: true, .. } => {
+                Section::Dawn(*day)
+            }
+            E::SheriffCandidates { .. }
+            | E::SheriffSpeech { .. }
+            | E::SheriffSideSpeech { .. }
+            | E::SheriffElected { .. }
+            | E::SheriffDirection { .. } => Section::Sheriff,
+            E::DaySpeech { day, .. } => Section::DaySpeech(*day),
+            E::DayVoteCast { day, .. }
+            | E::DayLynch { day, .. }
+            | E::Death { day, night: false, .. }
+            | E::LastWords { day, night: false, .. } => Section::DayVote(*day),
+            E::HunterShot { .. } | E::BadgePass { .. } => Section::Skill,
+        }
+    }
+
+    fn section_key(s: &Section) -> (u8, u32) {
+        match s {
+            Section::Night(d) => (0, *d),
+            Section::Dawn(d) => (1, *d),
+            Section::Sheriff => (2, 0),
+            Section::DaySpeech(d) => (3, *d),
+            Section::DayVote(d) => (4, *d),
+            Section::Skill => (5, 0),
+        }
+    }
+
+    // 按段内顺序保留事件
+    let mut sections: Vec<(Section, Vec<&E>)> = vec![];
+    for ev in &game.recap_log {
+        let s = classify(ev);
+        let key = section_key(&s);
+        if let Some(last) = sections.last_mut() {
+            if section_key(&last.0) == key {
+                last.1.push(ev);
+                continue;
+            }
+        }
+        sections.push((s, vec![ev]));
+    }
+
+    // 渲染每段为一个 markdown 字符串
+    let mut out: Vec<String> = vec![];
+    for (section, events) in sections {
+        let mut buf = section.title();
+        buf.push('\n');
+        for ev in events {
+            let line = match ev {
+                E::GuardProtect { target, .. } => {
+                    format!("  🛡️ 守卫守了 **{}**", name(*target))
+                }
+                E::WolfFinalTarget { target, .. } => match target {
+                    Some(t) => format!("  🐺 狼人合议 → **{}**", name(*t)),
+                    None => "  🐺 狼人空刀".to_string(),
+                },
+                E::SeerCheck { target, is_wolf, .. } => {
+                    let badge = if *is_wolf { "🐺 狼人" } else { "✅ 好人" };
+                    format!("  🔮 预言家查验 **{}** → {}", name(*target), badge)
+                }
+                E::Witch { save, poison, .. } => {
+                    let mut parts: Vec<String> = vec![];
+                    if *save {
+                        parts.push("救人".into());
+                    }
+                    if let Some(t) = poison {
+                        parts.push(format!("毒杀 **{}**", name(*t)));
+                    }
+                    if parts.is_empty() {
+                        parts.push("跳过".into());
+                    }
+                    format!("  🧪 女巫 {}", parts.join(" + "))
+                }
+                E::Death { player, cause, .. } => {
+                    format!("  ☠️ **{}** {}", name(*player), cause.label())
+                }
+                E::LastWords { player, text, .. } => {
+                    format!("  💬 **{}** 遗言：{}", name(*player), text)
+                }
+                E::SheriffCandidates { candidates } => {
+                    let names: Vec<&str> = candidates.iter().map(|i| name(*i)).collect();
+                    if names.is_empty() {
+                        "  无人上警".into()
+                    } else {
+                        format!("  候选人：{}", names.join(" / "))
+                    }
+                }
+                E::SheriffSpeech { player, text } => {
+                    format!("  🎤 **{}** (上警发言)：{}", name(*player), text)
+                }
+                E::SheriffSideSpeech { player, text } => {
+                    format!("  💭 **{}** (警下)：{}", name(*player), text)
+                }
+                E::SheriffElected { player } => match player {
+                    Some(p) => format!("  🎖️ **{}** 当选警长", name(*p)),
+                    None => "  ⚠️ 流局，本局无警长".into(),
+                },
+                E::SheriffDirection { clockwise } => {
+                    format!(
+                        "  ➡️ 警长选择 **{}** 起手，警长本人末位归票",
+                        if *clockwise { "警上 (顺时针)" } else { "警下 (逆时针)" }
+                    )
+                }
+                E::DaySpeech { player, text, .. } => {
+                    format!("  🎤 **{}**：{}", name(*player), text)
+                }
+                E::DayVoteCast { voter, target, weight, .. } => {
+                    let arrow = match target {
+                        Some(t) => format!("→ **{}**", name(*t)),
+                        None => "→ 弃权".into(),
+                    };
+                    let w_marker = if *weight == 3 { " (警徽 ×1.5)" } else { "" };
+                    format!("  {} {}{}", name(*voter), arrow, w_marker)
+                }
+                E::DayLynch { target, .. } => match target {
+                    Some(t) => format!("  🪦 **{}** 被放逐", name(*t)),
+                    None => "  🤝 流局，无人放逐".into(),
+                },
+                E::HunterShot { shooter, target, .. } => match target {
+                    Some(t) => format!("  🏹 **{}** 开枪带走 **{}**", name(*shooter), name(*t)),
+                    None => format!("  🏹 **{}** 选择不开枪", name(*shooter)),
+                },
+                E::BadgePass { from, to, .. } => match to {
+                    Some(t) => format!(
+                        "  🎖️ 警徽从 **{}** 移交给 **{}**",
+                        name(*from),
+                        name(*t)
+                    ),
+                    None => format!("  ✂️ **{}** 撕毁警徽", name(*from)),
+                },
+            };
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        out.push(buf);
+    }
+    out
 }
+

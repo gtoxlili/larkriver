@@ -8,8 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use async_openai::{
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, ResponseFormat,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ResponseFormat,
     },
     Client,
 };
@@ -75,22 +75,48 @@ impl LlmClient {
         Self { client, model }
     }
 
-    /// Generic JSON-object chat completion used by features outside poker
-    /// (狼人杀, …) — sends a system + user message, asks for a single JSON
-    /// object back, returns the raw content string. Caller deserialises.
+    /// Generic JSON-object chat completion. 单轮 system + user 的简化入口，
+    /// 内部委托给 `chat_json_with_messages`。
     pub async fn chat_json(&self, system: &str, user: &str) -> Result<String> {
+        self.chat_json_with_messages(&[
+            ("system".to_string(), system.to_string()),
+            ("user".to_string(), user.to_string()),
+        ])
+        .await
+    }
+
+    /// 多轮对话版：接收 (role, content) 列表，role 仅识别 `system` / `user` /
+    /// `assistant`。
+    ///
+    /// 用于 retry-with-feedback：当 AI 返回非法答案时，把 [assistant: 上次答案,
+    /// user: 拒绝原因] 追加进消息列表再请求一次，让 LLM 看到自己刚才的失败并
+    /// 重选——比无脑重试 / bot 兜底有用得多。
+    pub async fn chat_json_with_messages(
+        &self,
+        msgs: &[(String, String)],
+    ) -> Result<String> {
+        let mut request_msgs = Vec::with_capacity(msgs.len());
+        for (role, content) in msgs {
+            let m: async_openai::types::ChatCompletionRequestMessage = match role.as_str() {
+                "system" => ChatCompletionRequestSystemMessageArgs::default()
+                    .content(content.as_str())
+                    .build()?
+                    .into(),
+                "user" => ChatCompletionRequestUserMessageArgs::default()
+                    .content(content.as_str())
+                    .build()?
+                    .into(),
+                "assistant" => ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(content.as_str())
+                    .build()?
+                    .into(),
+                other => return Err(anyhow!("unknown chat role: {other}")),
+            };
+            request_msgs.push(m);
+        }
         let req = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
-            .messages([
-                ChatCompletionRequestSystemMessageArgs::default()
-                    .content(system)
-                    .build()?
-                    .into(),
-                ChatCompletionRequestUserMessageArgs::default()
-                    .content(user)
-                    .build()?
-                    .into(),
-            ])
+            .messages(request_msgs)
             .response_format(ResponseFormat::JsonObject)
             .temperature(0.9)
             .build()?;
