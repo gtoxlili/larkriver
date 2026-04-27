@@ -3,7 +3,7 @@ use crate::feishu::cards::*;
 use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
 use crate::game::{*, Persona};
-use crate::llm::{DecisionContext, LlmClient};
+use crate::llm::{AiDecision, DecisionContext, LlmClient};
 use crate::poker::{category_name, DeckMode};
 use crate::storage::Store;
 
@@ -755,11 +755,13 @@ impl Bot {
             // AI seat — pause briefly so the chat doesn't feel robotic, then
             // ask the LLM and apply the action.
             tokio::time::sleep(Duration::from_millis(800)).await;
-            let action = self.ai_decide(chat_id, &actor_id).await;
+            let decision = self.ai_decide(chat_id, &actor_id).await;
             let result = {
                 let mut games = self.games.lock();
                 let Some(g) = games.get_mut(chat_id) else { return; };
-                let r = g.act(&actor_id, action).map(|outcome| (outcome, snapshot(g)));
+                let r = g
+                    .act(&actor_id, decision.action)
+                    .map(|outcome| (outcome, snapshot(g)));
                 if r.is_ok() {
                     self.persist_locked(chat_id, g);
                 }
@@ -768,7 +770,16 @@ impl Bot {
             match result {
                 Ok((outcome, snap)) => {
                     let hand_ended = outcome.summary.is_some();
+                    let actor_name = snap
+                        .players
+                        .iter()
+                        .find(|p| p.open_id == actor_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| actor_id.clone());
                     self.publish_action_messages(chat_id, &snap, &outcome).await;
+                    if let Some(quip) = decision.quip {
+                        self.post_ai_quip(chat_id, &actor_name, &quip).await;
+                    }
                     if hand_ended {
                         return;
                     }
@@ -783,20 +794,35 @@ impl Bot {
     }
 
     /// Build the LLM context (with a fresh equity Monte Carlo) and ask the
-    /// model. With no LLM configured, plays a safe default (check or fold).
-    async fn ai_decide(&self, chat_id: &str, ai_id: &str) -> PlayerAction {
+    /// model. With no LLM configured, plays a safe default (check or fold)
+    /// and never quips.
+    async fn ai_decide(&self, chat_id: &str, ai_id: &str) -> AiDecision {
         let Some(ctx) = self.build_ai_context(chat_id, ai_id) else {
-            return PlayerAction::Fold;
+            return AiDecision { action: PlayerAction::Fold, quip: None };
         };
         match &self.llm {
             Some(llm) => llm.decide(&ctx).await,
             None => {
-                if ctx.to_call == 0 {
+                let action = if ctx.to_call == 0 {
                     PlayerAction::Check
                 } else {
                     PlayerAction::Fold
-                }
+                };
+                AiDecision { action, quip: None }
             }
+        }
+    }
+
+    /// Post the AI's in-character one-liner to the group as a plain text
+    /// message. Best-effort — failures are swallowed.
+    async fn post_ai_quip(&self, chat_id: &str, ai_name: &str, quip: &str) {
+        let text = format!("💬 {}: {}", ai_name, quip);
+        if let Err(e) = self
+            .client
+            .send_message("chat_id", chat_id, "text", &text_content(&text))
+            .await
+        {
+            warn!(?e, %chat_id, "failed to post AI quip");
         }
     }
 
