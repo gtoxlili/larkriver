@@ -173,9 +173,11 @@ pub fn submit_button(text: &str, value: Value, style: &str) -> Value {
     })
 }
 
-/// Lay out multiple buttons in a horizontal row, each shrinking to its
-/// natural width. The whole row stays left-aligned so buttons cluster
-/// together rather than spreading edge-to-edge.
+/// Lay out multiple buttons in a horizontal row that wraps on narrow screens.
+///
+/// `flex_mode: "flow"` 让窄屏（移动端）放不下时自动换行，而不是把按钮挤成
+/// 一坨字看不清。`width: "auto"` 让每个按钮按文字宽度占位，不强行等分。
+/// `vertical_spacing` 给换行后的两行之间留间距。
 pub fn button_row(buttons: Vec<Value>) -> Value {
     if buttons.len() == 1 {
         return buttons.into_iter().next().unwrap();
@@ -193,7 +195,9 @@ pub fn button_row(buttons: Vec<Value>) -> Value {
         .collect();
     json!({
         "tag": "column_set",
+        "flex_mode": "flow",
         "horizontal_spacing": "8px",
+        "vertical_spacing": "8px",
         "horizontal_align": "left",
         "columns": cols,
     })

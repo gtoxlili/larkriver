@@ -6,6 +6,7 @@ use crate::game::{*, Persona};
 use crate::llm::{AiDecision, DecisionContext, LlmClient};
 use crate::poker::{category_name, DeckMode};
 use crate::storage::Store;
+use crate::werewolf::WolfGame;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -17,26 +18,31 @@ use tracing::{info, warn};
 
 pub struct Bot {
     pub client: Arc<FeishuClient>,
-    cfg: Config,
-    games: Mutex<HashMap<String, Game>>, // chat_id → game
-    bot_open_id: Mutex<Option<String>>,
+    pub(crate) cfg: Config,
+    pub(crate) games: Mutex<HashMap<String, Game>>, // chat_id → game
+    /// Werewolf games keyed by chat_id, parallel to `games`. A chat can host
+    /// both a poker table and a werewolf table simultaneously — they share
+    /// nothing except the same dedup / LLM / store infrastructure.
+    pub(crate) wolf_games: Mutex<HashMap<String, WolfGame>>,
+    pub(crate) bot_open_id: Mutex<Option<String>>,
     /// Dedup cache keyed by `header.event_id` — catches Feishu's same-id
     /// retries within a long window.
-    seen_events: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_events: Mutex<HashMap<String, Instant>>,
     /// Fallback dedup keyed by a content fingerprint of card actions
     /// (`open_id` + `value` JSON). Catches the empirical case where Feishu
     /// re-delivers the *same logical click* under a different `event_id`.
     /// Short window (a few seconds) so legitimate re-clicks later are still
     /// processed.
-    seen_actions: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_actions: Mutex<HashMap<String, Instant>>,
     /// LLM client. `None` when `OPENAI_API_KEY` is unset → AI features hide.
-    llm: Option<LlmClient>,
+    pub(crate) llm: Option<LlmClient>,
     /// Disk-backed game state. Loaded on startup, written after each mutation.
-    store: Arc<Store>,
+    pub(crate) store: Arc<Store>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Command {
+pub(crate) enum Command {
+    // 德州扑克
     Join,
     Leave,
     Start,
@@ -44,6 +50,12 @@ enum Command {
     Chips,
     Reset,
     Help,
+    // 狼人杀
+    WolfJoin,
+    WolfLeave,
+    WolfStart,
+    WolfReset,
+    WolfHelp,
 }
 
 impl Bot {
@@ -59,12 +71,24 @@ impl Bot {
         let games = match store.load_all() {
             Ok(loaded) => {
                 if !loaded.is_empty() {
-                    info!(count = loaded.len(), "restored games from disk");
+                    info!(count = loaded.len(), "restored poker games from disk");
                 }
                 loaded
             }
             Err(e) => {
-                warn!(?e, "failed to load games from disk; starting empty");
+                warn!(?e, "failed to load poker games from disk; starting empty");
+                HashMap::new()
+            }
+        };
+        let wolf_games = match store.load_all_wolf() {
+            Ok(loaded) => {
+                if !loaded.is_empty() {
+                    info!(count = loaded.len(), "restored werewolf games from disk");
+                }
+                loaded
+            }
+            Err(e) => {
+                warn!(?e, "failed to load werewolf games from disk; starting empty");
                 HashMap::new()
             }
         };
@@ -72,6 +96,7 @@ impl Bot {
             client,
             cfg,
             games: Mutex::new(games),
+            wolf_games: Mutex::new(wolf_games),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(HashMap::new()),
             seen_actions: Mutex::new(HashMap::new()),
@@ -83,7 +108,7 @@ impl Bot {
     /// Save the current `Game` for `chat_id` to disk. Call from inside a
     /// `games.lock()` scope right after a successful mutation so persistence
     /// is serialised with the state change.
-    fn persist_locked(&self, chat_id: &str, game: &Game) {
+    pub(crate) fn persist_locked(&self, chat_id: &str, game: &Game) {
         if let Err(e) = self.store.save(chat_id, game) {
             warn!(?e, %chat_id, "persist game failed");
         }
@@ -97,7 +122,7 @@ impl Bot {
 
     /// Returns true if `event_id` has been seen in the last ~2 minutes.
     /// Empty `event_id` (legacy payloads without one) is never deduped.
-    fn is_duplicate_event(&self, event_id: &str) -> bool {
+    pub(crate) fn is_duplicate_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() {
             return false;
         }
@@ -122,7 +147,7 @@ impl Bot {
     /// the same logical click under different `event_id`s (which we've
     /// observed in practice — the docs claim card callbacks aren't retried,
     /// but they sometimes are).
-    fn is_duplicate_action(&self, action: &CardAction) -> bool {
+    pub(crate) fn is_duplicate_action(&self, action: &CardAction) -> bool {
         let fingerprint = format!(
             "{}|{}",
             action.open_id,
@@ -153,7 +178,7 @@ impl Bot {
         *self.bot_open_id.lock() = Some(open_id);
     }
 
-    fn bot_open_id_clone(&self) -> Option<String> {
+    pub(crate) fn bot_open_id_clone(&self) -> Option<String> {
         self.bot_open_id.lock().clone()
     }
 
@@ -196,13 +221,20 @@ impl Bot {
             Command::State => self.cmd_state(msg).await,
             Command::Chips => self.cmd_chips(msg).await,
             Command::Reset => self.cmd_reset(msg).await,
+            // 狼人杀文字命令：join/leave/reset 共用统一房间名册（走 poker 路径），
+            // 仅 start 走狼人杀专属流程。
+            Command::WolfHelp => self.send_wolf_help(msg).await,
+            Command::WolfJoin => self.cmd_join(msg).await,
+            Command::WolfLeave => self.cmd_leave(msg).await,
+            Command::WolfStart => self.do_start_wolf(&msg.chat_id).await,
+            Command::WolfReset => self.cmd_reset(msg).await,
         }
     }
 
     /// Send a card visible only to `msg.sender_open_id`. In a group chat that's
     /// an ephemeral message (others can't see it); in a 1-on-1 chat with the
     /// bot it falls back to a regular message (the chat is already private).
-    async fn send_user_only(&self, msg: &InboundMessage, card: &Value) -> Result<String> {
+    pub(crate) async fn send_user_only(&self, msg: &InboundMessage, card: &Value) -> Result<String> {
         if msg.chat_type == "p2p" {
             self.client
                 .send_message("chat_id", &msg.chat_id, "interactive", card)
@@ -308,16 +340,20 @@ impl Bot {
         self.refresh_lobby(chat_id).await
     }
 
-    async fn do_reset(&self, chat_id: &str) -> Result<()> {
+    pub(crate) async fn do_reset(&self, chat_id: &str) -> Result<()> {
         {
             self.games.lock().remove(chat_id);
+            self.wolf_games.lock().remove(chat_id);
         }
         self.forget_chat(chat_id);
+        if let Err(e) = self.store.delete_wolf(chat_id) {
+            warn!(?e, %chat_id, "delete wolf game failed");
+        }
         // After reset, post a fresh lobby card to invite players in.
         let _ = self.refresh_lobby(chat_id).await;
         let c = card(
-            header("♻️ 牌桌已重置", "wathet"),
-            vec![div_md("点击下方大厅卡片的 **加入** 按钮重新开始。")],
+            header("♻️ 房间已重置", "wathet"),
+            vec![div_md("点击下方大厅卡的 **加入** 重新开始。")],
         );
         self.client
             .send_message("chat_id", chat_id, "interactive", &c)
@@ -328,12 +364,29 @@ impl Bot {
     /// Post or update the persistent lobby card in `chat_id`. Idempotent — safe to call
     /// after every state change. If the card for this chat doesn't exist yet, posts a
     /// new one and stores its message_id for future in-place updates.
-    async fn refresh_lobby(&self, chat_id: &str) -> Result<()> {
+    ///
+    /// 统一的大厅卡同时反映德州和狼人杀两种状态：进行中只显示状态，空闲时显示
+    /// 双模式开局按钮。
+    pub(crate) async fn refresh_lobby(&self, chat_id: &str) -> Result<()> {
+        let wolf_status = {
+            let wgames = self.wolf_games.lock();
+            wgames.get(chat_id).map(|g| WolfLobbyStatus {
+                in_progress: !matches!(
+                    g.stage,
+                    crate::werewolf::game::Stage::Lobby | crate::werewolf::game::Stage::Ended
+                ),
+                stage_label: g.stage.label().to_string(),
+                day: g.day,
+            })
+        };
         let (card_value, existing_msg_id) = {
             let games = self.games.lock();
             let Some(game) = games.get(chat_id) else { return Ok(()); };
             let snap = snapshot(game);
-            (build_lobby_card(&snap, self.llm.is_some()), game.lobby_msg_id.clone())
+            (
+                build_lobby_card(&snap, self.llm.is_some(), wolf_status.as_ref()),
+                game.lobby_msg_id.clone(),
+            )
         };
 
         if let Some(msg_id) = existing_msg_id {
@@ -416,6 +469,94 @@ impl Bot {
             DeckMode::Standard
         };
         self.do_start(&msg.chat_id, mode).await
+    }
+
+    /// 从统一房间名册启动一局狼人杀。把 poker `Game` 里的玩家 (open_id / 名字 /
+    /// AI / persona) 拷贝到一个新的 `WolfGame`，然后走标准的开局流程：身份揭晓
+    /// → 公开公告 → AI 推进。
+    pub(crate) async fn do_start_wolf(&self, chat_id: &str) -> Result<()> {
+        // 1. 校验：房间内有玩家、人数 4-10、当前没有进行中的牌局
+        {
+            let games = self.games.lock();
+            let g = games
+                .get(chat_id)
+                .ok_or_else(|| anyhow!("当前没有玩家，先 join"))?;
+            let n = g.players.len();
+            if !(9..=12).contains(&n) {
+                return Err(anyhow!("狼人杀需要 9-12 名玩家，当前 {}", n));
+            }
+            if !matches!(g.stage, Stage::Lobby | Stage::Ended) {
+                return Err(anyhow!("德州牌局进行中，结束后再开狼人杀"));
+            }
+        }
+        {
+            let wgames = self.wolf_games.lock();
+            if let Some(wg) = wgames.get(chat_id) {
+                if !matches!(
+                    wg.stage,
+                    crate::werewolf::game::Stage::Lobby | crate::werewolf::game::Stage::Ended
+                ) {
+                    return Err(anyhow!("狼人杀进行中"));
+                }
+            }
+        }
+
+        // 2. 拷贝名册到新的 WolfGame，然后 start_game()
+        let (start_card, role_revealing): (Value, Vec<(String, Value, bool)>) = {
+            let games = self.games.lock();
+            let g = games
+                .get(chat_id)
+                .ok_or_else(|| anyhow!("房间消失了"))?;
+
+            let mut wolf = crate::werewolf::WolfGame::new(chat_id.to_string());
+            for p in &g.players {
+                if p.is_ai {
+                    let persona = p.persona.unwrap_or_else(Persona::random);
+                    wolf.add_ai_player(p.open_id.clone(), p.name.clone(), persona)?;
+                } else {
+                    wolf.add_player(p.open_id.clone(), p.name.clone())?;
+                }
+            }
+            wolf.start_game()?;
+
+            let start = crate::werewolf::cards::build_game_start_card(&wolf);
+            let mut reveals: Vec<(String, Value, bool)> = vec![];
+            for p in &wolf.players {
+                let c = crate::werewolf::cards::build_role_reveal_card(&wolf, p);
+                reveals.push((p.open_id.clone(), c, p.is_ai));
+            }
+
+            // 写入 wolf_games map + 持久化
+            drop(games);
+            let mut wgames = self.wolf_games.lock();
+            wgames.insert(chat_id.to_string(), wolf.clone());
+            self.persist_wolf_locked(chat_id, &wolf);
+
+            (start, reveals)
+        };
+
+        // 3. 刷新统一大厅卡（显示"狼人杀进行中"）
+        let _ = self.refresh_lobby(chat_id).await;
+
+        // 4. 公开公告
+        let _ = self
+            .client
+            .send_message("chat_id", chat_id, "interactive", &start_card)
+            .await;
+
+        // 5. 身份卡（仅人类）
+        for (open_id, c, is_ai) in role_revealing {
+            if is_ai {
+                continue;
+            }
+            if let Err(e) = self.client.send_ephemeral_card(chat_id, &open_id, &c).await {
+                warn!(?e, %open_id, "failed to send wolf role reveal");
+            }
+        }
+
+        // 6. 推进到第 1 夜 AI / 等待人类
+        self.advance_wolf(chat_id).await;
+        Ok(())
     }
 
     async fn do_start(&self, chat_id: &str, mode: DeckMode) -> Result<()> {
@@ -521,6 +662,12 @@ impl Bot {
         else {
             return Ok(json!({}));
         };
+
+        // 狼人杀按钮：所有以 `wolf_` 开头的 action 全部交给狼人杀 handlers。
+        if action_id.starts_with("wolf_") {
+            return self.handle_wolf_card_action(action, action_id).await;
+        }
+
         let chat_id = action
             .value
             .get("chat_id")
@@ -536,8 +683,10 @@ impl Bot {
                 | "leave_lobby"
                 | "start_lobby"
                 | "start_lobby_short"
+                | "start_wolf_lobby"
                 | "join_ai_lobby"
                 | "remove_ai_lobby"
+                | "reset_lobby"
         ) {
             let bot = self.clone();
             let aid = action_id.clone();
@@ -556,8 +705,10 @@ impl Bot {
                     "leave_lobby" => bot.do_leave(&cid, &oid).await,
                     "start_lobby" => bot.do_start(&cid, DeckMode::Standard).await,
                     "start_lobby_short" => bot.do_start(&cid, DeckMode::ShortDeck).await,
+                    "start_wolf_lobby" => bot.do_start_wolf(&cid).await,
                     "join_ai_lobby" => bot.do_join_ai(&cid).await,
                     "remove_ai_lobby" => bot.do_remove_ai(&cid).await,
+                    "reset_lobby" => bot.do_reset(&cid).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = res {
@@ -1160,7 +1311,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_empty, true)).await?;
+            &build_lobby_card(&snap_empty, true, None)).await?;
 
         // --------- 4. lobby with 2 waiting ---------
         let n = step("lobby waiting");
@@ -1178,7 +1329,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby2, true)).await?;
+            &build_lobby_card(&snap_lobby2, true, None)).await?;
 
         // --------- 5. lobby in-progress ---------
         let n = step("lobby in-progress");
@@ -1196,7 +1347,7 @@ impl Bot {
             mode: DeckMode::Standard,
         };
         cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby_inprog, true)).await?;
+            &build_lobby_card(&snap_lobby_inprog, true, None)).await?;
 
         // --------- 6. hand start ---------
         let n = step("hand start");
@@ -1395,7 +1546,7 @@ fn cards_row(cards: &[crate::poker::Card]) -> Value {
     column_set(cols)
 }
 
-fn toast(msg: &str) -> Value {
+pub(crate) fn toast(msg: &str) -> Value {
     json!({
         "toast": {
             "type": "warning",
@@ -1506,8 +1657,17 @@ fn parse_command(
         }
         cleaned = cleaned.replace(&m.key, "");
     }
-    let body_str: String = if cleaned.trim_start().starts_with("/poker") {
-        cleaned.trim_start().trim_start_matches("/poker").trim().to_string()
+    // 识别狼人杀前缀：/wolf | /狼 | /狼人杀，或 @bot wolf|狼|狼人 后跟子命令。
+    let trimmed = cleaned.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("/wolf")
+        .or_else(|| trimmed.strip_prefix("/狼人杀"))
+        .or_else(|| trimmed.strip_prefix("/狼"))
+    {
+        return parse_wolf_subcommand(rest.trim());
+    }
+    let body_str: String = if let Some(rest) = trimmed.strip_prefix("/poker") {
+        rest.trim().to_string()
     } else if mentioned_bot {
         cleaned.trim().to_string()
     } else {
@@ -1516,6 +1676,11 @@ fn parse_command(
     let body = body_str.to_lowercase();
     let mut parts = body.split_whitespace();
     let cmd = parts.next()?;
+    // @bot wolf <sub>: 把第一个词当作 namespace 切到狼人杀
+    if matches!(cmd, "wolf" | "狼" | "狼人" | "狼人杀") {
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        return parse_wolf_subcommand(&rest);
+    }
     Some(match cmd {
         "join" | "加入" => Command::Join,
         "leave" | "离开" => Command::Leave,
@@ -1524,6 +1689,24 @@ fn parse_command(
         "chips" | "stack" | "筹码" => Command::Chips,
         "reset" | "重置" => Command::Reset,
         "help" | "帮助" | "?" => Command::Help,
+        _ => return None,
+    })
+}
+
+/// 解析狼人杀子命令：`join` / `leave` / `start` / `reset` / `help`。
+/// 空字符串等价于 `help`，方便 `/wolf` 单独输入也有反馈。
+fn parse_wolf_subcommand(body: &str) -> Option<Command> {
+    let body = body.to_lowercase();
+    let mut parts = body.split_whitespace();
+    let Some(sub) = parts.next() else {
+        return Some(Command::WolfHelp);
+    };
+    Some(match sub {
+        "join" | "加入" => Command::WolfJoin,
+        "leave" | "离开" => Command::WolfLeave,
+        "start" | "begin" | "go" | "开始" => Command::WolfStart,
+        "reset" | "重置" => Command::WolfReset,
+        "help" | "帮助" | "?" => Command::WolfHelp,
         _ => return None,
     })
 }
@@ -1549,30 +1732,57 @@ fn build_welcome_card(chat_id: &str, name: &str) -> Value {
     )
 }
 
-/// The persistent "lobby" card: a single message in the chat that's updated in
-/// place as players join/leave, and that flips to a "in-progress" view (with no
-/// buttons) for the duration of a hand.
-fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
-    let in_progress = matches!(
+/// 狼人杀状态摘要，给统一大厅卡用。`None` 表示当前没有狼人杀牌局。
+#[derive(Debug, Clone)]
+pub struct WolfLobbyStatus {
+    pub in_progress: bool,
+    pub stage_label: String,
+    pub day: u32,
+}
+
+/// 统一大厅卡：同一个 chat 只发一张卡，跟踪当前共享的玩家名册。
+///
+/// 模式切换通过按钮决定：玩家先 [加入] 进场，然后点 [开始德州] / [短牌] /
+/// [开始狼人杀] 选择本局玩什么。任一模式进行中时全部按钮收起。
+fn build_lobby_card(
+    snap: &GameSnapshot,
+    ai_enabled: bool,
+    wolf: Option<&WolfLobbyStatus>,
+) -> Value {
+    let poker_in_progress = matches!(
         snap.stage,
         Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River | Stage::Showdown
     );
+    let wolf_in_progress = wolf.map(|w| w.in_progress).unwrap_or(false);
+    let any_in_progress = poker_in_progress || wolf_in_progress;
 
-    let subtitle = if in_progress {
-        format!("第 {} 局 · {} · 底池 {}", snap.hand_count, snap.stage.label(), snap.pot)
+    let n = snap.players.len();
+    let subtitle = if poker_in_progress {
+        format!(
+            "🎰 德州第 {} 局 · {} · 底池 {}",
+            snap.hand_count,
+            snap.stage.label(),
+            snap.pot
+        )
+    } else if let Some(w) = wolf {
+        if w.in_progress {
+            format!("🐺 狼人杀 · {} · 第 {} 天", w.stage_label, w.day)
+        } else {
+            format!("已就座 {} 人 · 选择模式开局", n)
+        }
     } else if snap.hand_count == 0 {
-        format!("已就座 {} 人 · 等待开局", snap.players.len())
+        format!("已就座 {} 人 · 选择模式开局", n)
     } else {
-        format!("已就座 {} 人 · 已进行 {} 局", snap.players.len(), snap.hand_count)
+        format!("已就座 {} 人 · 已打过 {} 局德州", n, snap.hand_count)
     };
 
     let mut elements: Vec<Value> = vec![];
 
     if snap.players.is_empty() {
-        elements.push(markdown("🪑 牌桌空空如也，点击下方 **加入** 就座。"));
+        elements.push(markdown(
+            "🪑 房间空空如也，点击下方 **加入** 就座。\n选择 [开始德州] 或 [开始狼人杀] 决定本局玩什么。",
+        ));
     } else {
-        // Avatar row for joined HUMANS only — AI seats have synthetic open_ids
-        // that Feishu's person_list resolves to "未知用户".
         let active_ids: Vec<String> = snap
             .players
             .iter()
@@ -1583,50 +1793,57 @@ fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
             elements.push(person_list(&active_ids));
         }
 
-        // Detailed lines (chips + status markers) below the avatars.
+        // 玩家列表：德州进行中显示筹码 / 状态；其他时候简化成名字 + 标记。
         let lines: Vec<String> = snap
             .players
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let dealer = if i == snap.dealer_idx && snap.hand_count > 0 {
-                    " 🅓"
+                if poker_in_progress {
+                    let dealer = if i == snap.dealer_idx && snap.hand_count > 0 {
+                        " 🅓"
+                    } else {
+                        ""
+                    };
+                    let status = if p.sat_out {
+                        " 💤"
+                    } else if p.folded {
+                        " ✗"
+                    } else if p.all_in {
+                        " ★"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "• {}{}{} — {} 筹码",
+                        display_name(p),
+                        dealer,
+                        status,
+                        p.chips
+                    )
                 } else {
-                    ""
-                };
-                let status = if p.sat_out {
-                    " 💤"
-                } else if p.folded {
-                    " ✗"
-                } else if p.all_in {
-                    " ★"
-                } else {
-                    ""
-                };
-                format!(
-                    "• {}{}{} — {} 筹码",
-                    display_name(p), dealer, status, p.chips
-                )
+                    format!("• {} — {} 筹码", display_name(p), p.chips)
+                }
             })
             .collect();
         elements.push(markdown(&lines.join("\n")));
     }
 
-    if !in_progress {
+    if !any_in_progress {
         let v_base = json!({ "chat_id": snap.chat_id });
-        let mut buttons = vec![button(
+        let mut roster_buttons = vec![button(
             "加入",
             merge(&v_base, &json!({ "action": "join_lobby" })),
             "primary",
         )];
         if ai_enabled {
-            buttons.push(button(
+            roster_buttons.push(button(
                 "加入 AI",
                 merge(&v_base, &json!({ "action": "join_ai_lobby" })),
                 "default",
             ));
             if snap.players.iter().any(|p| p.is_ai) {
-                buttons.push(button(
+                roster_buttons.push(button(
                     "移除 AI",
                     merge(&v_base, &json!({ "action": "remove_ai_lobby" })),
                     "default",
@@ -1634,36 +1851,69 @@ fn build_lobby_card(snap: &GameSnapshot, ai_enabled: bool) -> Value {
             }
         }
         if !snap.players.is_empty() {
-            buttons.push(button(
+            roster_buttons.push(button(
                 "离开",
                 merge(&v_base, &json!({ "action": "leave_lobby" })),
                 "default",
             ));
         }
-        let chip_holders = snap.players.iter().filter(|p| p.chips > 0).count();
-        if chip_holders >= 2 {
-            buttons.push(button(
-                "开局",
-                merge(&v_base, &json!({ "action": "start_lobby" })),
-                "primary",
-            ));
-            buttons.push(button(
-                "短牌",
-                merge(&v_base, &json!({ "action": "start_lobby_short" })),
-                "default",
-            ));
-        }
-        elements.push(actions(buttons));
-        elements.push(note_md(
-            "初始 1000 筹码 · 小盲 5 / 大盲 10 · 手牌仅本人可见",
+        roster_buttons.push(button(
+            "重置",
+            merge(&v_base, &json!({ "action": "reset_lobby" })),
+            "default",
         ));
-    } else {
-        elements.push(note_md("牌局进行中，结束后可点按钮加入下一局。"));
+        elements.push(actions(roster_buttons));
+
+        // 模式选择按钮——根据人数决定哪个模式可点
+        let chip_holders = snap.players.iter().filter(|p| p.chips > 0).count();
+        let poker_ready = chip_holders >= 2;
+        let wolf_ready = (9..=12).contains(&n);
+        if poker_ready || wolf_ready {
+            elements.push(crate::feishu::cards::hr());
+            elements.push(markdown("**选择本局玩什么：**"));
+            let mut mode_buttons = vec![];
+            if poker_ready {
+                mode_buttons.push(button(
+                    "🎰 开始德州",
+                    merge(&v_base, &json!({ "action": "start_lobby" })),
+                    "primary",
+                ));
+                mode_buttons.push(button(
+                    "🎰 短牌德州",
+                    merge(&v_base, &json!({ "action": "start_lobby_short" })),
+                    "default",
+                ));
+            }
+            if wolf_ready {
+                mode_buttons.push(button(
+                    "🐺 开始狼人杀",
+                    merge(&v_base, &json!({ "action": "start_wolf_lobby" })),
+                    "primary",
+                ));
+            }
+            elements.push(actions(mode_buttons));
+        }
+
+        // 提示 hint
+        let mut hints = vec!["德州初始 1000 筹码 · 小盲 5 / 大盲 10".to_string()];
+        if !wolf_ready && n < 9 {
+            hints.push(format!("狼人杀需 9-12 人，还差 {} 人", 9_usize.saturating_sub(n)));
+        } else if !wolf_ready && n > 12 {
+            hints.push("狼人杀最多 12 人".into());
+        }
+        if !poker_ready {
+            hints.push("德州需 ≥ 2 名持筹码玩家".into());
+        }
+        elements.push(note_md(&hints.join(" · ")));
+    } else if poker_in_progress {
+        elements.push(note_md("🎰 德州牌局进行中，结束后可继续选择模式。"));
+    } else if wolf_in_progress {
+        elements.push(note_md("🐺 狼人杀进行中，结束后可继续选择模式。"));
     }
 
-    let template = if in_progress { "wathet" } else { "turquoise" };
+    let template = if any_in_progress { "wathet" } else { "turquoise" };
     card(
-        header_with_subtitle("🎰 德州扑克 · 大厅", &subtitle, template),
+        header_with_subtitle("🎲 房间 · 大厅", &subtitle, template),
         elements,
     )
 }

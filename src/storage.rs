@@ -8,6 +8,7 @@
 //! [redb]: https://github.com/cberner/redb
 
 use crate::game::Game;
+use crate::werewolf::WolfGame;
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 const GAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("games");
+const WOLF_GAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("wolf_games");
 
 pub struct Store {
     db: Database,
@@ -31,10 +33,11 @@ impl Store {
         }
         let db = Database::create(path)
             .with_context(|| format!("opening redb at {}", path.display()))?;
-        // Touch the table so subsequent reads on a fresh DB don't fail.
+        // Touch the tables so subsequent reads on a fresh DB don't fail.
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(GAMES)?;
+            let _ = txn.open_table(WOLF_GAMES)?;
         }
         txn.commit()?;
         Ok(Arc::new(Self { db }))
@@ -76,6 +79,46 @@ impl Store {
                 }
                 Err(e) => {
                     warn!(?e, chat_id = %key, "skipping unparseable game record");
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn save_wolf(&self, chat_id: &str, game: &WolfGame) -> Result<()> {
+        let bytes = serde_json::to_vec(game)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut t = txn.open_table(WOLF_GAMES)?;
+            t.insert(chat_id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_wolf(&self, chat_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut t = txn.open_table(WOLF_GAMES)?;
+            t.remove(chat_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_wolf(&self) -> Result<HashMap<String, WolfGame>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(WOLF_GAMES)?;
+        let mut out = HashMap::new();
+        for kv in t.iter()? {
+            let (k, v) = kv?;
+            let key = k.value().to_string();
+            match serde_json::from_slice::<WolfGame>(v.value()) {
+                Ok(game) => {
+                    out.insert(key, game);
+                }
+                Err(e) => {
+                    warn!(?e, chat_id = %key, "skipping unparseable wolf record");
                 }
             }
         }
@@ -128,5 +171,29 @@ mod tests {
         assert_eq!(store.load_all().unwrap().len(), 1);
         store.delete("oc_x").unwrap();
         assert_eq!(store.load_all().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wolf_round_trip_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            let store = Store::open(&path).unwrap();
+            let mut g = WolfGame::new("oc_w".into());
+            for i in 0..9 {
+                g.add_player(format!("p{i}"), format!("P{i}")).unwrap();
+            }
+            g.start_game().unwrap();
+            store.save_wolf(&g.chat_id, &g).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let games = store.load_all_wolf().unwrap();
+            assert_eq!(games.len(), 1);
+            let g = games.get("oc_w").unwrap();
+            assert_eq!(g.players.len(), 9);
+            assert_eq!(g.day, 1);
+            assert!(g.players.iter().all(|p| p.role.is_some()));
+        }
     }
 }

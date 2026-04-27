@@ -75,6 +75,48 @@ impl LlmClient {
         Self { client, model }
     }
 
+    /// Generic JSON-object chat completion used by features outside poker
+    /// (狼人杀, …) — sends a system + user message, asks for a single JSON
+    /// object back, returns the raw content string. Caller deserialises.
+    pub async fn chat_json(&self, system: &str, user: &str) -> Result<String> {
+        let req = CreateChatCompletionRequestArgs::default()
+            .model(&self.model)
+            .messages([
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(system)
+                    .build()?
+                    .into(),
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(user)
+                    .build()?
+                    .into(),
+            ])
+            .response_format(ResponseFormat::JsonObject)
+            .temperature(0.9)
+            .build()?;
+        let response = self.client.chat().create(req).await?;
+        let choice = response
+            .choices
+            .first()
+            .ok_or_else(|| anyhow!("empty LLM response (no choices)"))?;
+        let content = choice
+            .message
+            .content
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        if content.is_empty() {
+            let reason = choice
+                .finish_reason
+                .map(|r| format!("{r:?}"))
+                .unwrap_or_else(|| "unknown".into());
+            return Err(anyhow!(
+                "LLM returned empty content (finish_reason={reason})"
+            ));
+        }
+        Ok(content.to_string())
+    }
+
     /// Ask the LLM to pick an action. Returns a clamped, legal action plus
     /// an optional persona-flavoured one-liner the bot may post to the chat.
     /// Falls back to "check if free, otherwise fold" + no quip on failure.

@@ -257,8 +257,8 @@ impl Game {
         if self.players.iter().any(|p| p.open_id == open_id) {
             return Err(anyhow!("你已经在桌上了"));
         }
-        if self.players.len() >= 10 {
-            return Err(anyhow!("人数已满 (10)"));
+        if self.players.len() >= 12 {
+            return Err(anyhow!("人数已满 (12)"));
         }
         self.players.push(Player {
             open_id,

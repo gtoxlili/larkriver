@@ -6,6 +6,7 @@ mod llm;
 mod poker;
 mod server;
 mod storage;
+mod werewolf;
 
 use anyhow::Result;
 use std::time::Duration;
