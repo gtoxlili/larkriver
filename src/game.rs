@@ -8,41 +8,41 @@ use serde::{Deserialize, Serialize};
 /// some flavor for casual play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Persona {
-    /// 松凶 / LAG — plays many hands, aggressive, lots of c-bets and bluffs.
+    /// 莽哥 / LAG — 牌不挑、敢开火、敢加注、敢诈唬。
     LooseAggressive,
-    /// 紧凶 / TAG — narrow range but bets/raises hard when in.
+    /// 老炮 / TAG — 选牌严但出手猛，价值下注绝不手软。
     TightAggressive,
-    /// 鱼 / 松弱 — calls too much, almost never raises, can't fold.
+    /// 跟注站 / 松弱 — 上来就想看牌，跟到底，几乎不主动加注。
     LooseWeak,
-    /// 岩石 / 紧弱 — only plays premium hands, never bluffs.
+    /// 老抠 / 紧弱 — 强牌才肯下场，从不诈唬。
     TightWeak,
-    /// 疯狂 / Maniac — raises and re-raises constantly, hates folding.
+    /// 头铁 / Maniac — 每手都想梭哈，弃牌不存在的。
     Maniac,
 }
 
 impl Persona {
     pub fn label(self) -> &'static str {
         match self {
-            Persona::LooseAggressive => "松凶",
-            Persona::TightAggressive => "紧凶",
-            Persona::LooseWeak => "鱼",
-            Persona::TightWeak => "岩石",
-            Persona::Maniac => "疯狂",
+            Persona::LooseAggressive => "莽哥",
+            Persona::TightAggressive => "老炮",
+            Persona::LooseWeak => "跟注站",
+            Persona::TightWeak => "老抠",
+            Persona::Maniac => "头铁",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
             Persona::LooseAggressive =>
-                "玩很多手牌、敢开火、敢加注、敢诈唬。常用边缘手和持续下注 (c-bet) 给对手施压，能弃牌但不轻易弃。",
+                "上头型，看哪手牌都觉得能打。开池就加注，被加注就再加。靠气势压人，弃牌？看心情。",
             Persona::TightAggressive =>
-                "牌池窄、出手猛。差牌坚决弃，进入底池后用价值下注 / 加注主动塑造底池，避免被动。",
+                "老手了，一眼看穿牌强不强。烂牌直接扔，进底池就当真打。不爱诈唬，但价值下注绝不手软。",
             Persona::LooseWeak =>
-                "喜欢看牌跟到底，舍不得弃。很少主动加注。除非被反复打到否则一路跟。",
+                "上来就想看牌。手里只要有点东西就想跟到底，连对都没有也想再看一张。基本不主动加注，输了也认。",
             Persona::TightWeak =>
-                "极度保守。只在拿到 QQ+ / AK / 同花连张这类强牌时进入底池，没成对就弃，从不诈唬。",
+                "一毛不拔型。AA / KK / AK 这种强牌才肯下场，对手一加注就开始怀疑自己被打到。从不主动开火，从不诈唬。",
             Persona::Maniac =>
-                "几乎每手都要加注或再加注，喜欢诈唬和半诈唬，希望用激进的下注节奏把对手赶出底池。很难弃牌。",
+                "手感一来就梭哈，每手都想打到底，诈唬比谁都猛。弃牌？不存在的。",
         }
     }
 
