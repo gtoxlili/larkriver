@@ -20,4 +20,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"          # whole-program LTO across crates
+codegen-units = 1    # one codegen unit, slowest compile / smallest+fastest binary
+strip = "symbols"    # drop symbol tables from the final binary
+
+# Faster incremental dev builds — keep dev deps in release-style optimisation
+# so cargo test isn't painfully slow once we bump the release profile.
+[profile.dev.package."*"]
+opt-level = 1

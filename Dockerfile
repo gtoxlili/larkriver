@@ -1,32 +1,30 @@
 # syntax=docker/dockerfile:1
 
-# ---------- build stage ----------
+# ---------- build ----------
 FROM rust:latest AS builder
 WORKDIR /app
 
-# 1) Pre-compile the dependency graph against a dummy main so that subsequent
-#    edits to src/ only re-link the binary instead of recompiling every crate.
+# Pre-compile the dependency graph against a dummy main so subsequent edits
+# under src/ only re-link the binary instead of recompiling every crate.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
     && rm -rf src target/release/deps/lark_poker* target/release/lark-poker*
 
-# 2) Real build.
+# Real build. Release profile is tuned in Cargo.toml (fat LTO, single codegen
+# unit, stripped symbols) — no extra cargo flags needed here.
 COPY src ./src
-RUN cargo build --release \
-    && strip target/release/lark-poker
+RUN cargo build --release
 
-# ---------- runtime stage ----------
-FROM debian:latest
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/target/release/lark-poker /usr/local/bin/lark-poker
+# ---------- runtime ----------
+# distroless base = glibc + libssl + ca-certs + tzdata, no shell, no package
+# manager. Runs as uid 65532 (`nonroot`). Final image ≈ 30 MB.
+FROM gcr.io/distroless/base-debian12:nonroot
+COPY --from=builder /app/target/release/lark-poker /app/lark-poker
 
 EXPOSE 8080
 ENV RUST_LOG=lark_poker=info,tower_http=info \
     BIND_ADDR=0.0.0.0:8080
 
-ENTRYPOINT ["/usr/local/bin/lark-poker"]
+ENTRYPOINT ["/app/lark-poker"]
