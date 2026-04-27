@@ -1,80 +1,164 @@
 # lark-poker
 
-Texas Hold'em poker bot for a Feishu (Lark) group chat, written in Rust.
+飞书群聊德州扑克机器人。
 
-Players type `@bot join` to enter the next hand and `@bot start` to deal. All in-game
-actions (Fold/Check/Call/Raise/All-in) are buttons on interactive cards. Hole cards
-are sent as direct messages (DMs) so other players cannot see them.
+- 多玩家德州扑克，支持边池和全押
+- 卡片 JSON 2.0：手牌方块、加注 form 输入、按钮分级
+- 手牌通过 ephemeral 群消息发送（仅本人可见，无需私聊机器人）
+- 行动卡 ephemeral 给当前 actor，其他人只看公开公告
 
-## Quick start
+## 部署
 
-```bash
-cp .env.example .env
-# Edit .env with your app credentials and chat id
-cargo run --release
-```
-
-### Run with Docker
+### 1. 拉镜像并运行
 
 ```bash
-docker build -t lark-poker .
-docker run --rm -p 8080:8080 --env-file .env lark-poker
+docker pull ghcr.io/gtoxlili/lark-poker:latest
+
+docker run -d \
+  --name lark-poker \
+  --restart unless-stopped \
+  -e FEISHU_APP_ID=<your_app_id> \
+  -e FEISHU_APP_SECRET=<your_app_secret> \
+  -e ALLOWED_CHAT_ID=<oc_xxx> \
+  -e BIND_ADDR=0.0.0.0:8080 \
+  -e RUST_LOG=lark_poker=info,tower_http=info \
+  -p 8080:8080 \
+  ghcr.io/gtoxlili/lark-poker:latest
 ```
 
-Then expose the HTTP port (default `:8080`) to the public internet (e.g. `ngrok http 8080`)
-and set the resulting `https://.../webhook/event` and `https://.../webhook/card` URLs in
-your Feishu app's **Event Subscriptions** and **Card Request URL** pages.
+### 2. HTTPS 反代
 
-## Required Feishu app permissions
+飞书 webhook 必须 HTTPS。Caddy 示例：
 
-In the Feishu Developer Console under **Permissions & Scopes**, enable:
+```caddy
+poker.your-domain.com {
+    reverse_proxy localhost:8080
+}
+```
 
-| Scope | Purpose |
-| ----- | ------- |
-| `im:message` | Send messages |
-| `im:message:send_as_bot` | Send as the bot |
-| `im:message.group_at_msg` (or `:readonly`) | Receive @-mentions in group |
-| `im:message.p2p_msg` (or `:readonly`) | Receive direct messages |
-| `im:chat:readonly` | Read group info / member list |
+### 3. 飞书后台配置
 
-Subscribe to these **events** under **Event Subscriptions**:
+在 [飞书开放平台](https://open.feishu.cn/app) 新建企业自建应用，添加机器人能力。
 
-- `im.message.receive_v1` — receive group/DM messages
+**权限管理**
 
-Add the bot to the target group, then in **Settings of the bot** enable
-"Card Action Configuration" and set the card request URL.
+| Scope | 用途 |
+| --- | --- |
+| `im:message:send_as_bot` | 发消息 |
+| `im:message.group_at_msg:readonly` | 接收群里 @ 机器人 |
+| `im:chat:readonly` | 读群成员、用户进群事件 |
 
-## How to play
+**事件配置**（事件与回调 → 事件配置）
 
-1. In the group, send `@bot join` — repeat for every player.
-2. Once at least 2 have joined, anyone sends `@bot start`.
-3. Each player receives their hole cards as a DM from the bot.
-4. The group sees community cards, the pot, and a card with action buttons for
-   the player to act. Click a button to take action.
-5. After the river or once everyone but one folds, the bot announces the winner
-   and adjusts chip stacks. Run `@bot start` again to play another hand with the
-   same players.
+- 订阅方式：将事件发送至开发者服务器
+- 请求地址：`https://poker.your-domain.com/webhook/event`
+- 订阅事件：
+  - `im.message.receive_v1`
+  - `im.chat.member.user.added_v1`
 
-## Commands (group chat, with @-mention)
+不要在事件配置页订阅 `card.action.trigger`。
 
-| Command | Effect |
-| ------- | ------ |
-| `join`  | Enter the lobby for the next hand |
-| `leave` | Leave the lobby |
-| `start` | Deal a new hand (≥ 2 players required) |
-| `state` | Re-post the current game state |
-| `chips` | List every player's chip stack |
-| `reset` | Reset the table (clears chips and players) |
+**回调配置**（事件与回调 → 回调配置）
 
-## Project layout
+- 请求地址：`https://poker.your-domain.com/webhook/card`
+- 订阅回调：仅 `card.action.trigger`
+- 删除：`card.action.trigger_v1`、`url.preview.get`、`profile.view.get`
+
+`card.action.trigger_v1` 和 `card.action.trigger` 同时订阅会造成同一次按钮点击发两份回调。
+
+**版本管理与发布**
+
+每次改完订阅或权限都要创建版本并发布。
+
+### 4. 把机器人拉进群
+
+群设置 → 机器人 → 添加机器人。
+
+## 玩法
+
+群里 @ 机器人加关键词，或 `/poker <关键词>`：
+
+| 命令 | 说明 |
+| --- | --- |
+| `join` / `加入` | 入桌 |
+| `leave` / `离开` | 离桌（牌局未开始时） |
+| `start` / `开始` | 开局，需 ≥ 2 名持筹码玩家 |
+| `state` / `状态` | 查看当前状态（私下回复） |
+| `chips` / `筹码` | 查看各家筹码（私下回复） |
+| `reset` / `重置` | 重置牌桌 |
+| `help` / `帮助` | 帮助卡 |
+
+也可以点持久化大厅卡上的 `[加入]` `[离开]` `[开局]` 按钮。
+
+行动按钮只发给当前 actor，仅他可见，包括 `[弃牌] [跟注 X] [全押]` 一行 + 加注 form 输入框 + 三个加注预设。
+
+## 自审应用版本
+
+如果有 admin bot 已开通 `application:application.app_version` scope，可调 PATCH API 给其他 bot 自动通过审核：
+
+```bash
+# 列待审版本
+curl -s "https://open.feishu.cn/open-apis/application/v6/applications/<APP_ID>/app_versions?page_size=5" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  | jq '.data.items[] | {version_id, version, status}'
+
+# status: 1=通过, 2=拒绝, 3=审核中, 4=未提交
+curl -X PATCH \
+  "https://open.feishu.cn/open-apis/application/v6/applications/<APP_ID>/app_versions/<oav_xxx>?user_id_type=open_id&operator_id=<YOUR_OPEN_ID>" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"status": 1}'
+```
+
+`operator_id` 必须放在 query string，不在 body。
+
+## 注意事项
+
+- 卡片 JSON 2.0 要求 Lark 客户端 v7.20+
+- 游戏状态在内存里，重启会丢失当前牌局，玩家筹码回到初始 1000
+- 牌局卡住用 `/poker reset` 手动重置
+- 双层去重抗飞书重投：`event_id`（120s 窗口） + `(open_id, value)` 指纹（3s 窗口）
+
+## 项目结构
 
 ```
 src/
-  main.rs        # entry point
-  config.rs      # env config
-  feishu/        # Feishu API client + card builders + event types
-  poker/         # Cards, deck, 7-card hand evaluator
-  game.rs        # Game state machine (betting, side pots, showdown)
-  bot.rs         # Maps Feishu events → game actions and back
-  server.rs      # axum HTTP server (webhook endpoints)
+├── main.rs          入口；--mock <open_id> 把所有卡片样式发到群里看
+├── config.rs        env 加载
+├── feishu/
+│   ├── client.rs    token 缓存 + 发消息 / 临时消息 / 更新卡片
+│   ├── cards.rs     JSON 2.0 helpers
+│   └── events.rs    webhook payload 解析
+├── poker/
+│   ├── card.rs      Card / Suit / Rank / Deck
+│   └── hand.rs      7 张牌评估器
+├── game.rs          状态机
+├── bot.rs           事件分发 + 卡片渲染 + dedup
+└── server.rs        axum HTTP server
 ```
+
+## 开发
+
+```bash
+git clone https://github.com/gtoxlili/lark-poker
+cd lark-poker
+cp .env.example .env
+cargo run --release
+cargo test
+```
+
+把所有卡片样式发到 `ALLOWED_CHAT_ID` 看效果：
+
+```bash
+./target/release/lark-poker --mock <你的 open_id>
+```
+
+## CI 和镜像
+
+每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/lark-poker:{latest, main, sha-<short>, v<semver>}`。
+
+Dockerfile 用 cargo-chef 缓存依赖，distroless/cc-debian12:nonroot 作运行时，最终镜像约 30 MB。
+
+## License
+
+MIT
