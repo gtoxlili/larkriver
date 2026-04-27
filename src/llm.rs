@@ -91,10 +91,14 @@ impl LlmClient {
                     .into(),
             ])
             .response_format(ResponseFormat::JsonObject)
-            // Casual chat-room poker — keep the model focused (low temperature)
-            // and the response short (decision JSON is < 100 tokens).
-            .temperature(0.4)
-            .max_tokens(150u32)
+            // Higher temperature so the AI's play has personality / variance —
+            // casual chat-room poker is more fun if the bot doesn't always pick
+            // the same action in the same spot. reasoning_effort defaults to
+            // "high" for normal requests on V4 models (only auto-bumps to
+            // "max" for agent-style calls), which is what we want — leaving
+            // it unset.
+            .temperature(0.9)
+            .max_tokens(200u32)
             .build()?;
 
         let response = self.client.chat().create(req).await?;
