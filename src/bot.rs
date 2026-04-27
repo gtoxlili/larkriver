@@ -1148,11 +1148,19 @@ impl Bot {
     /// Debug: 构造一个 8 玩家（4 真人 + 4 AI）的代表性大厅快照，把按钮换行 /
     /// 间距 / 配色 在真实卡片上跑一遍，发到 `recipient_open_id` 的 ephemeral。
     /// 用法：`larkriver --debug-lobby <name|open_id>`，迭代 UI 不需要重新部署。
+    ///
+    /// 真人玩家的 open_id 全部用 recipient 自己 + bot 自己（display_name 会渲染
+    /// 成 `<at>` 标签，飞书校验里假 open_id 会触发 18054 internal error）。
     pub async fn send_debug_lobby(
         &self,
         chat_id: &str,
         recipient_open_id: &str,
     ) -> Result<()> {
+        // 用 bot 自己的 open_id 作为"另一个真人"占位，保证所有 <at id> 都能解析。
+        let bot_oid = self
+            .bot_open_id_clone()
+            .unwrap_or_else(|| recipient_open_id.to_string());
+
         let mk = |id: &str, name: &str, chips: u64, is_ai: bool| PlayerSnapshot {
             open_id: id.into(),
             name: name.into(),
@@ -1166,6 +1174,7 @@ impl Bot {
         };
         // 8 玩家 → 触发"加入 / 加入 AI / 移除 AI / 离开 / 重置 / 开始德州 /
         // 短牌德州 / 开始狼人杀" 8 个按钮，最容易看出移动端换行效果。
+        // 4 个 AI 用合成 ai:N（不进 <at>，display_name 会用 emoji+加粗渲染）。
         let snap = GameSnapshot {
             chat_id: chat_id.into(),
             stage: Stage::Lobby,
@@ -1179,9 +1188,9 @@ impl Bot {
             current_open_id: None,
             players: vec![
                 mk(recipient_open_id, "你", 1000, false),
-                mk("ou_dummy_2", "玩家 2", 1000, false),
-                mk("ou_dummy_3", "玩家 3", 1000, false),
-                mk("ou_dummy_4", "玩家 4", 1000, false),
+                mk(&bot_oid, "玩家 2", 1000, false),
+                mk(recipient_open_id, "玩家 3", 1000, false),
+                mk(&bot_oid, "玩家 4", 1000, false),
                 mk("ai:1", "莽哥 #1", 1000, true),
                 mk("ai:2", "老炮 #2", 1000, true),
                 mk("ai:3", "跟注站 #3", 1000, true),
