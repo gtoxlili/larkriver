@@ -197,7 +197,6 @@ pub fn button_row(buttons: Vec<Value>) -> Value {
         "tag": "column_set",
         "flex_mode": "flow",
         "horizontal_spacing": "8px",
-        "vertical_spacing": "8px",
         "horizontal_align": "left",
         "columns": cols,
     })
