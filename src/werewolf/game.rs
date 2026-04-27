@@ -379,6 +379,12 @@ pub struct WolfGame {
     pub pending_hunter: Option<usize>,
     /// 猎人因什么死的，决定开枪后回到哪个阶段（晚上死了→白天揭晓；白天死了→检查胜负后进夜晚）。
     pub pending_hunter_post_stage: Option<Stage>,
+    /// AI 在遗言阶段就一并决策的开枪目标，HunterShoot 阶段直接使用而不再调一次 LLM。
+    /// 语义：`None` = 还没决策；`Some(None)` = 决策不开枪；`Some(Some(idx))` = 决策打 idx。
+    /// 这是为了让 AI 的"遗言 + 开枪"在**同一个 LLM 上下文**里产出一致的决定，避免
+    /// 两次独立调用导致言行矛盾（说"我带走 4 号"但实际不开枪）。
+    #[serde(default)]
+    pub pending_hunter_ai_decision: Option<Option<usize>>,
 
     // ---- 公开行动日志 ----
     /// 给 AI 看的事件历史，自然语言一行一条。
@@ -486,6 +492,7 @@ impl WolfGame {
             pending_badge_post_stage: None,
             pending_hunter: None,
             pending_hunter_post_stage: None,
+            pending_hunter_ai_decision: None,
             event_log: vec![],
             deaths: vec![],
             recap_log: vec![],
@@ -663,6 +670,7 @@ impl WolfGame {
         self.pending_badge_post_stage = None;
         self.pending_hunter = None;
         self.pending_hunter_post_stage = None;
+        self.pending_hunter_ai_decision = None;
         self.event_log.clear();
         self.deaths.clear();
         self.recap_log.clear();
@@ -1880,6 +1888,7 @@ impl WolfGame {
         // 把夜里的死亡加到 last_night_deaths（用于白天广播）
         let post = self.pending_hunter_post_stage.take();
         self.pending_hunter = None;
+        self.pending_hunter_ai_decision = None;
         if matches!(post, Some(Stage::DayReveal)) {
             if let Some(t) = shot_idx {
                 self.last_night_deaths.push(t);

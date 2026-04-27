@@ -1145,6 +1145,118 @@ pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> String {
     }
 }
 
+// ============================================================================
+// 死亡遗言 + 开枪 (合并决策)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct DyingShooterResp {
+    speech: Option<String>,
+    /// 开枪目标 idx，-1 表示不开枪
+    #[serde(default)]
+    target_idx: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    thinking: Option<String>,
+}
+
+/// AI 倒地猎人 / 狼王的合并决策：遗言 + 开枪 **一次性**输出。
+/// 这是为了让 AI 在同一个 LLM 上下文里产出言行一致的决定，避免两次独立调用
+/// 导致"遗言里说带走 X，实际不开枪"那种矛盾。
+#[derive(Debug, Clone)]
+pub struct DyingShooterDecision {
+    pub speech: String,
+    /// `None` = 决定不开枪；`Some(idx)` = 决定带走 idx
+    pub target: Option<usize>,
+}
+
+pub async fn dying_hunter_combined(
+    llm: &LlmClient,
+    view: &PublicView<'_>,
+    history: &AttemptHistory,
+) -> DyingShooterDecision {
+    let candidates: Vec<(usize, String)> = view
+        .players
+        .iter()
+        .filter(|(i, _, alive)| *alive && *i != view.me_idx)
+        .map(|(i, n, _)| (*i, n.clone()))
+        .collect();
+
+    let team = if view.me_role.is_wolf() {
+        "你的阵营是狼。"
+    } else {
+        "你的阵营是好人。"
+    };
+
+    let system = format!(
+        "你是飞书群里的狼人杀玩家，扮演 **{}**，刚刚死亡。{}\n\
+         {}\n\n{}\n\n## 任务（一次性两件事）\n\
+         1. **遗言**（公开广播给所有玩家）\n\
+         2. **开枪**：可选一名存活的非自己玩家带走 (target_idx = idx)，\
+            或选择不开枪 (target_idx = -1)\n\n\
+         **遗言和开枪决策必须一致**——你在遗言里说什么，开枪就要怎么做：\n\
+         - 如果你在遗言里报『我带走 N 号』，target_idx 必须是 N 号的 idx\n\
+         - 如果你在遗言里说『不开枪』或没提目标，target_idx 应该是 -1\n\
+         - 如果遗言里嫁祸 / 留给场上推理，开枪选择应当配合那个叙事\n\n\
+         注：公开广播只显示『X 临死前开枪带走 Y』或『X 选择不开枪』，**不会标记你的身份**\
+         （猎人和狼王共享开枪技能，狼王惯例伪装成猎人）。\n\n\
+         返回 JSON: {{\"speech\": \"<遗言, ≤100 字>\", \"target_idx\": <整数 idx 或 -1>, \"thinking\": \"...\"}}",
+        view.me_role.label(),
+        team,
+        persona_line(view.persona),
+        RULES,
+    );
+    let cands: Vec<String> = candidates
+        .iter()
+        .map(|(i, n)| format!("{} = {}", i, n))
+        .collect();
+    let user = format!(
+        "{}\n\n## 候选开枪目标（仅这些 idx 合法，或 -1 不开枪）\n{}",
+        view.render(),
+        cands.join("\n"),
+    );
+
+    let raw = match chat_with_history(llm, system, user, history).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(?e, "dying_hunter_combined LLM call failed");
+            return DyingShooterDecision {
+                speech: String::new(),
+                target: None,
+            };
+        }
+    };
+    let parsed: DyingShooterResp = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?e, content = %raw, "dying_hunter_combined JSON parse failed");
+            return DyingShooterDecision {
+                speech: String::new(),
+                target: None,
+            };
+        }
+    };
+    let speech = parsed
+        .speech
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(250).collect::<String>())
+        .unwrap_or_default();
+    let target = match parsed.target_idx {
+        Some(t) if t >= 0 => {
+            let idx = t as usize;
+            if candidates.iter().any(|(i, _)| *i == idx) {
+                Some(idx)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    DyingShooterDecision { speech, target }
+}
+
 /// AI 白天轮流发言。带上当天死讯 / 历史发言上下文，要求按角色立场说话。
 pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
     let team = if view.me_role.is_wolf() {

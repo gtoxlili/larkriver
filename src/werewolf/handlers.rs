@@ -1610,18 +1610,63 @@ impl Bot {
                         // 全员说完
                         let mut games = self.wolf_games.lock();
                         if let Some(g) = games.get_mut(chat_id) {
-                            let _ = g.finish_last_words();
+                            if let Err(e) = g.finish_last_words() {
+                                warn!(?e, "finish_last_words failed, force-routing");
+                                // 兜底：手动按 finish_last_words 的逻辑切 stage
+                                if g.pending_hunter.is_some() {
+                                    g.stage = Stage::HunterShoot;
+                                } else if g.pending_badge.is_some() {
+                                    g.stage = Stage::BadgePass;
+                                } else {
+                                    let post = g.last_words_post_stage.take();
+                                    match post {
+                                        Some(Stage::DayReveal) => g.stage = Stage::DayReveal,
+                                        _ => {
+                                            // 进下一夜：直接调 advance_to_next_night_or_end 等价物
+                                            g.stage = Stage::DayReveal; // 安全兜底
+                                        }
+                                    }
+                                }
+                            }
                             self.persist_wolf_locked(chat_id, g);
                         }
                         continue;
                     };
                     if is_ai {
-                        let text = self.last_words_ai(chat_id, spk_idx).await;
-                        {
-                            let mut games = self.wolf_games.lock();
-                            if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.submit_last_words(&spk_oid, text);
-                                self.persist_wolf_locked(chat_id, g);
+                        // 当前说遗言的人正好是要开枪的猎人/狼王 → 走 combined：
+                        // 同一次 LLM 同时产出遗言 + 开枪决策，避免言行不一。
+                        let is_dying_shooter = {
+                            let games = self.wolf_games.lock();
+                            games
+                                .get(chat_id)
+                                .map(|g| g.pending_hunter == Some(spk_idx))
+                                .unwrap_or(false)
+                        };
+                        if is_dying_shooter {
+                            let decision = self.dying_shooter_combined_ai(chat_id, spk_idx).await;
+                            {
+                                let mut games = self.wolf_games.lock();
+                                if let Some(g) = games.get_mut(chat_id) {
+                                    if let Err(e) = g.submit_last_words(&spk_oid, decision.speech) {
+                                        warn!(?e, %spk_oid, "submit_last_words failed (combined), force-advancing");
+                                        g.last_words_idx += 1;
+                                    }
+                                    // 把开枪目标存到游戏状态，HunterShoot 阶段直接用，不再调 LLM
+                                    g.pending_hunter_ai_decision = Some(decision.target);
+                                    self.persist_wolf_locked(chat_id, g);
+                                }
+                            }
+                        } else {
+                            let text = self.last_words_ai(chat_id, spk_idx).await;
+                            {
+                                let mut games = self.wolf_games.lock();
+                                if let Some(g) = games.get_mut(chat_id) {
+                                    if let Err(e) = g.submit_last_words(&spk_oid, text) {
+                                        warn!(?e, %spk_oid, "submit_last_words failed, force-advancing");
+                                        g.last_words_idx += 1;
+                                    }
+                                    self.persist_wolf_locked(chat_id, g);
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1645,7 +1690,11 @@ impl Bot {
                     let Some((spk_idx, spk_oid, is_ai)) = current else {
                         let mut games = self.wolf_games.lock();
                         if let Some(g) = games.get_mut(chat_id) {
-                            let _ = g.finish_sheriff_side_speeches();
+                            if let Err(e) = g.finish_sheriff_side_speeches() {
+                                warn!(?e, "finish_sheriff_side_speeches failed, force-advancing to SheriffVote");
+                                g.stage = Stage::SheriffVote;
+                                g.sheriff_votes.clear();
+                            }
                             self.persist_wolf_locked(chat_id, g);
                         }
                         continue;
@@ -1655,7 +1704,10 @@ impl Bot {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.submit_sheriff_side_speech(&spk_oid, text);
+                                if let Err(e) = g.submit_sheriff_side_speech(&spk_oid, text) {
+                                    warn!(?e, %spk_oid, "submit_sheriff_side_speech failed, force-advancing");
+                                    g.sheriff_side_idx += 1;
+                                }
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1683,7 +1735,10 @@ impl Bot {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.finish_sheriff_speeches();
+                                if let Err(e) = g.finish_sheriff_speeches() {
+                                    warn!(?e, "finish_sheriff_speeches failed, force-advancing to SheriffSideSpeech");
+                                    g.stage = Stage::SheriffSideSpeech;
+                                }
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1695,7 +1750,10 @@ impl Bot {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.submit_sheriff_speech(&spk_oid, text);
+                                if let Err(e) = g.submit_sheriff_speech(&spk_oid, text) {
+                                    warn!(?e, %spk_oid, "submit_sheriff_speech failed, force-advancing");
+                                    g.sheriff_speech_idx += 1;
+                                }
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1728,7 +1786,12 @@ impl Bot {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.enter_day_vote();
+                                // enter_day_vote 失败时强行设 stage 防止死循环
+                                if let Err(e) = g.enter_day_vote() {
+                                    warn!(?e, "enter_day_vote failed, force-setting stage");
+                                    g.stage = Stage::DayVote;
+                                    g.day_votes.clear();
+                                }
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1750,7 +1813,18 @@ impl Bot {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.submit_day_speech(&spk_oid, text);
+                                // submit 失败强行推进 idx 防止死循环
+                                if let Err(e) = g.submit_day_speech(&spk_oid, text) {
+                                    warn!(
+                                        ?e,
+                                        %spk_oid,
+                                        spk_idx,
+                                        idx = g.day_speech_idx,
+                                        order_len = g.day_speech_order.len(),
+                                        "submit_day_speech failed, force-advancing idx"
+                                    );
+                                    g.day_speech_idx += 1;
+                                }
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
@@ -1922,12 +1996,15 @@ impl Bot {
                         return;
                     }
 
-                    // AI 猎人 retry-with-feedback
-                    let mut hist: AttemptHistory = vec![];
+                    // 优先使用遗言阶段已经决策好的目标 —— 一次 LLM 调用搞定遗言+开枪
+                    let pre_decided = {
+                        let games = self.wolf_games.lock();
+                        games.get(chat_id).and_then(|g| g.pending_hunter_ai_decision)
+                    };
                     let mut shot_idx: Option<usize> = None;
                     let mut decided = false;
-                    for _ in 0..3 {
-                        let target_opt = self.hunter_ai_pick(chat_id, h_idx, &hist).await;
+
+                    if let Some(target_opt) = pre_decided {
                         let target_oid = target_opt.and_then(|t| {
                             let games = self.wolf_games.lock();
                             games.get(chat_id).and_then(|g| {
@@ -1943,19 +2020,47 @@ impl Bot {
                             }
                             r
                         };
-                        match r {
-                            Ok(s) => {
-                                shot_idx = s;
-                                decided = true;
-                                break;
+                        if let Ok(s) = r {
+                            shot_idx = s;
+                            decided = true;
+                        }
+                        // 如果预决目标因什么原因失败（如目标变化），落到下面 retry-with-feedback
+                    }
+
+                    // AI 猎人 retry-with-feedback（仅当预决不存在 / 失败时）
+                    let mut hist: AttemptHistory = vec![];
+                    if !decided {
+                        for _ in 0..3 {
+                            let target_opt = self.hunter_ai_pick(chat_id, h_idx, &hist).await;
+                            let target_oid = target_opt.and_then(|t| {
+                                let games = self.wolf_games.lock();
+                                games.get(chat_id).and_then(|g| {
+                                    g.players.get(t).map(|p| p.open_id.clone())
+                                })
+                            });
+                            let r = {
+                                let mut games = self.wolf_games.lock();
+                                let Some(g) = games.get_mut(chat_id) else { return };
+                                let r = g.hunter_shoot(&h_oid, target_oid.as_deref());
+                                if r.is_ok() {
+                                    self.persist_wolf_locked(chat_id, g);
+                                }
+                                r
+                            };
+                            match r {
+                                Ok(s) => {
+                                    shot_idx = s;
+                                    decided = true;
+                                    break;
+                                }
+                                Err(e) => hist.push((
+                                    format!(
+                                        "{{\"target_idx\": {}}}",
+                                        target_opt.map(|i| i as i64).unwrap_or(-1)
+                                    ),
+                                    e.to_string(),
+                                )),
                             }
-                            Err(e) => hist.push((
-                                format!(
-                                    "{{\"target_idx\": {}}}",
-                                    target_opt.map(|i| i as i64).unwrap_or(-1)
-                                ),
-                                e.to_string(),
-                            )),
                         }
                     }
                     if !decided {
@@ -2248,6 +2353,59 @@ impl Bot {
             Some(llm) => wolf_llm::sheriff_direction(llm, &view).await,
             None => true, // 默认警上
         }
+    }
+
+    /// 倒地猎人 / 狼王的合并决策：遗言 + 开枪目标 一次 LLM 调用搞定。
+    /// retry-with-feedback：如果 LLM 给的开枪目标违法（死人 / 自己），
+    /// 把错误反馈让 LLM 重选一遍。
+    async fn dying_shooter_combined_ai(
+        &self,
+        chat_id: &str,
+        ai_idx: usize,
+    ) -> wolf_llm::DyingShooterDecision {
+        let game_snapshot = {
+            let games = self.wolf_games.lock();
+            games.get(chat_id).cloned()
+        };
+        let Some(game) = game_snapshot else {
+            return wolf_llm::DyingShooterDecision { speech: String::new(), target: None };
+        };
+        let view = wolf_llm::build_view(&game, ai_idx);
+        let mut hist: AttemptHistory = vec![];
+        // 候选目标：alive 且非自己
+        let valid_targets: std::collections::HashSet<usize> = game
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.alive && *i != ai_idx)
+            .map(|(i, _)| i)
+            .collect();
+        for _ in 0..3 {
+            let llm = match &self.llm {
+                Some(l) => l,
+                None => {
+                    return wolf_llm::DyingShooterDecision { speech: String::new(), target: None };
+                }
+            };
+            let decision = wolf_llm::dying_hunter_combined(llm, &view, &hist).await;
+            // 验证目标合法性
+            match decision.target {
+                None => return decision, // 不开枪 — 永远合法
+                Some(idx) if valid_targets.contains(&idx) => return decision,
+                Some(idx) => {
+                    hist.push((
+                        format!(
+                            "{{\"speech\": \"{}\", \"target_idx\": {}}}",
+                            decision.speech.replace('"', "'"),
+                            idx
+                        ),
+                        format!("idx {} 不是合法目标（必须是存活的非自己玩家）", idx),
+                    ));
+                }
+            }
+        }
+        // 3 次都没给合法答案 → 留遗言不开枪
+        wolf_llm::DyingShooterDecision { speech: String::new(), target: None }
     }
 
     async fn last_words_ai(&self, chat_id: &str, ai_idx: usize) -> String {
