@@ -173,4 +173,49 @@ impl Client {
             .unwrap_or("玩家")
             .to_string())
     }
+
+    /// 列出群成员 (open_id, name)。需要 `im:chat:readonly` 权限。分页拉到尾。
+    pub async fn list_chat_members(&self, chat_id: &str) -> Result<Vec<(String, String)>> {
+        let token = self.tenant_access_token().await?;
+        let mut out: Vec<(String, String)> = vec![];
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members?\
+                 member_id_type=open_id&page_size=100"
+            );
+            if let Some(pt) = &page_token {
+                url.push_str(&format!("&page_token={pt}"));
+            }
+            let resp: Value = self
+                .http
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await?
+                .json()
+                .await?;
+            if resp["code"].as_i64().unwrap_or(-1) != 0 {
+                return Err(anyhow!("list_chat_members failed: {resp}"));
+            }
+            if let Some(items) = resp["data"]["items"].as_array() {
+                for item in items {
+                    let oid = item["member_id"].as_str().unwrap_or("").to_string();
+                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    if !oid.is_empty() {
+                        out.push((oid, name));
+                    }
+                }
+            }
+            let has_more = resp["data"]["has_more"].as_bool().unwrap_or(false);
+            if !has_more {
+                break;
+            }
+            page_token = resp["data"]["page_token"].as_str().map(String::from);
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }

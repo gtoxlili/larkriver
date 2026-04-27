@@ -53,6 +53,45 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--debug-lobby <name|open_id>`: 把代表性的大厅卡（8 个按钮）作为
+    // ephemeral 发给指定用户。用于在不重新部署的前提下迭代 UI 布局。
+    // 参数若以 `ou_` 开头视为 open_id；否则当作群成员姓名查表。
+    if args.len() >= 2 && args[1] == "--debug-lobby" {
+        let chat_id = bot
+            .cfg()
+            .allowed_chat_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("ALLOWED_CHAT_ID must be set in .env"))?;
+        let target = args.get(2).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: larkriver --debug-lobby <name|open_id>\n\
+                 (name = 群成员姓名, 如 \"高国泰\"；open_id 直接以 ou_ 开头)"
+            )
+        })?;
+        let recipient_oid = if target.starts_with("ou_") {
+            target.clone()
+        } else {
+            tracing::info!(name = %target, "looking up chat member by name");
+            let members = client.list_chat_members(&chat_id).await?;
+            members
+                .iter()
+                .find(|(_, name)| name == &target)
+                .map(|(oid, _)| oid.clone())
+                .ok_or_else(|| {
+                    let names: Vec<String> = members.iter().map(|(_, n)| n.clone()).collect();
+                    anyhow::anyhow!(
+                        "群里没找到名字 \"{target}\"。\n群成员：{}",
+                        names.join(" / ")
+                    )
+                })?
+        };
+        tracing::info!(
+            "sending debug lobby card to chat={chat_id} recipient={recipient_oid}"
+        );
+        bot.send_debug_lobby(&chat_id, &recipient_oid).await?;
+        return Ok(());
+    }
+
     server::run(bot, &bind_addr).await
 }
 
