@@ -1,25 +1,37 @@
 # syntax=docker/dockerfile:1
 
-# ---------- build ----------
-FROM rust:latest AS builder
+# ---------- planner: hash the dependency graph (cargo-chef recipe) ----------
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS chef
 WORKDIR /app
 
-# Pre-compile the dependency graph against a dummy main so subsequent edits
-# under src/ only re-link the binary instead of recompiling every crate.
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
-    && echo "fn main() {}" > src/main.rs \
-    && cargo build --release \
-    && rm -rf src target/release/deps/lark_poker* target/release/lark-poker*
-
-# Real build. Release profile is tuned in Cargo.toml (fat LTO, single codegen
-# unit, stripped symbols) — no extra cargo flags needed here.
 COPY src ./src
-RUN cargo build --release
+RUN cargo chef prepare --recipe-path recipe.json
 
-# ---------- runtime ----------
-# distroless base = glibc + libssl + ca-certs + tzdata, no shell, no package
-# manager. Runs as uid 65532 (`nonroot`). Final image ≈ 30 MB.
+# ---------- cooked: compile every dep once, in both debug+release profiles.
+# This layer's cache key is recipe.json (= Cargo.lock + manifests). Source
+# edits in src/ do NOT bust this layer.
+FROM chef AS cooked
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --recipe-path recipe.json \
+    && cargo chef cook --release --recipe-path recipe.json
+
+# ---------- source: shared base for test + builder ----------
+FROM cooked AS source
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# ---------- test: cargo test runs here. Failure aborts the whole build. ----
+FROM source AS test
+RUN cargo test --locked
+
+# ---------- builder: depends on test, so tests must pass before binary build.
+# Reuses the cooked release deps; only the lark-poker crate links here.
+FROM test AS builder
+RUN cargo build --release --locked
+
+# ---------- runtime: distroless base, ≈ 30 MB final image, runs as nonroot
 FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=builder /app/target/release/lark-poker /app/lark-poker
 
