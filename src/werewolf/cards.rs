@@ -914,21 +914,26 @@ pub fn build_vote_tally_card(game: &WolfGame) -> Value {
         lines.push(line);
     }
 
+    // 结果放进 body markdown 段，<at> 标签才会被正确渲染（subtitle 是
+    // plain_text，会把 <at id="..."> 当字面文本输出）。display_name 本身
+    // 对 AI 已经包了加粗 / emoji，不要再外层套 ** 否则嵌套加粗会破。
     let outcome = match game.last_day_lynched {
         Some(idx) => format!(
-            "🪦 **{}** 被投票放逐。",
+            "🪦 {} 被投票放逐。",
             display_name(&game.players[idx])
         ),
         None => "🤝 平票或全员弃权，无人放逐。".into(),
     };
 
+    let mut elements = vec![markdown(&outcome)];
+    if !lines.is_empty() {
+        elements.push(hr());
+        elements.push(markdown(&lines.join("\n")));
+    }
+
     card(
-        header_with_subtitle(
-            &format!("🗳️ 第 {} 天 · 投票结果", game.day),
-            &outcome,
-            "blue",
-        ),
-        vec![markdown(&lines.join("\n"))],
+        header(&format!("🗳️ 第 {} 天 · 投票结果", game.day), "blue"),
+        elements,
     )
 }
 
