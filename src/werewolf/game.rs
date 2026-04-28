@@ -1107,23 +1107,11 @@ impl WolfGame {
             self.pending_badge_post_stage = Some(Stage::DayReveal);
         }
 
-        // 3. 遗言队列：所有非毒杀死亡，按死亡顺序
-        let speakers: Vec<usize> = deaths
-            .iter()
-            .filter(|(_, c)| *c != DeathCause::Poison)
-            .map(|(i, _)| *i)
-            .collect();
-
-        // 4. 路由：有遗言 → LastWords；否则直接走技能链 / DayReveal
-        if !speakers.is_empty() {
-            self.last_words_queue = speakers;
-            self.last_words_idx = 0;
-            self.last_words_speeches.clear();
-            self.last_words_public_msg = None;
-            self.last_words_private_msg = None;
-            self.last_words_post_stage = Some(Stage::DayReveal);
-            self.stage = Stage::LastWords;
-        } else if self.pending_hunter.is_some() {
+        // 3. 路由：夜里死的人**不发表遗言**（全部静默）——遗言只发生在白天放逐。
+        //    例外：猎人/狼王 单独走 HunterShoot 阶段，由 dying_hunter_combined
+        //    一次性输出『临死一句话 + 开枪目标』，那一句话同时充当临终信号；
+        //    被开枪带走者本身也无遗言（与放逐不同）。
+        if self.pending_hunter.is_some() {
             self.stage = Stage::HunterShoot;
         } else if self.pending_badge.is_some() {
             self.stage = Stage::BadgePass;
@@ -2213,8 +2201,8 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_player_has_no_last_words() {
-        // 女巫毒人，被毒者没有遗言
+    fn night_deaths_have_no_last_words() {
+        // 夜里死的人（无论狼刀还是毒杀）都不发表遗言。
         let mut g = make_n(9);
         lock_roles_9(&mut g);
         // 狼空刀（投自己人也行，简化用同一个目标但跳过狼刀）
@@ -2258,12 +2246,12 @@ mod tests {
         g.wolf_pick("p2", "p8").unwrap();
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p1").unwrap();
-        // 女巫毒 P7（村民）。狼刀 P8 也死。预期：
-        // P8 (狼刀) 进 last_words，P7 (毒) 不进 last_words
+        // 女巫毒 P7（村民）。狼刀 P8 也死。两人都不进 last_words——夜里没有遗言阶段。
         g.witch_act("p4", false, Some("p7")).unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        assert_eq!(g.last_words_queue, vec![8]); // 仅 P8 (狼刀)，P7 (毒) 不在内
-        assert!(!g.players[7].alive); // 但 P7 确实死了
+        assert_eq!(g.stage, Stage::DayReveal);
+        assert!(g.last_words_queue.is_empty());
+        assert!(!g.players[8].alive); // P8 死于狼刀
+        assert!(!g.players[7].alive); // P7 死于毒
     }
 
     #[test]
@@ -2426,11 +2414,7 @@ mod tests {
         assert_eq!(g.stage, Stage::WitchAct);
 
         g.witch_act("p4", false, None).unwrap();
-        // 死者（村民 P8）说遗言
-        assert_eq!(g.stage, Stage::LastWords);
-        assert_eq!(g.last_words_queue, vec![8]);
-        g.submit_last_words("p8", "".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // 夜里死的人不说遗言，直接 DayReveal
         assert_eq!(g.stage, Stage::DayReveal);
         assert_eq!(g.last_night_deaths, vec![8]);
 
@@ -2493,11 +2477,8 @@ mod tests {
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p0").unwrap();
         g.witch_act("p4", false, None).unwrap();
-        // 猎人死了 → 先说遗言
-        assert_eq!(g.stage, Stage::LastWords);
-        assert_eq!(g.last_words_queue, vec![5]);
-        g.submit_last_words("p5", "".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // 夜里死的人不说遗言；猎人直接进 HunterShoot 阶段
+        // （由 dying_hunter_combined 一次性吐出『一句话+开枪目标』）
         assert_eq!(g.stage, Stage::HunterShoot);
 
         let shot = g.hunter_shoot("p5", Some("p0")).unwrap();
@@ -2552,12 +2533,9 @@ mod tests {
         g.advance_after_wolves().unwrap();
         g.seer_check("p4", "p0").unwrap();
         g.witch_act("p5", true, None).unwrap();
-        // 死了 P8 → 先遗言再 DayReveal
-        assert_eq!(g.stage, Stage::LastWords);
-        assert_eq!(g.last_night_deaths, vec![8], "同守同救应当死亡");
-        g.submit_last_words("p8", "".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // 死了 P8 → 夜里不说遗言，直接 DayReveal
         assert_eq!(g.stage, Stage::DayReveal);
+        assert_eq!(g.last_night_deaths, vec![8], "同守同救应当死亡");
     }
 
     #[test]
@@ -2633,10 +2611,7 @@ mod tests {
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p0").unwrap();
         g.witch_act("p4", false, None).unwrap();
-        // P9 死了 → 遗言阶段
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p9", "".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // P9 死于狼刀，夜里不说遗言，直接进 DayReveal
         assert_eq!(g.stage, Stage::DayReveal);
 
         // 进入上警阶段
@@ -2725,11 +2700,7 @@ mod tests {
         g.stage = Stage::WitchAct;
         g.night_victim = Some(3);
         g.witch_act("p4", false, None).unwrap();
-        // 警长死了 → 先说遗言
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p3", "".into()).unwrap();
-        g.finish_last_words().unwrap();
-        // 遗言完毕 → BadgePass
+        // 警长死于夜里，不说遗言；pending_badge 走 BadgePass
         assert_eq!(g.stage, Stage::BadgePass);
         assert_eq!(g.pending_badge, Some(3));
 
