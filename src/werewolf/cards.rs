@@ -195,7 +195,7 @@ pub fn build_guard_night_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "primary",
     );
-    elements.push(actions(buttons));
+    elements.extend(button_grid(buttons, 3));
     elements.push(note("仅你可见 · 同守同救会导致目标依然死亡"));
     card(
         header_with_subtitle(
@@ -321,7 +321,7 @@ pub fn build_wolf_night_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "danger",
     );
-    elements.push(actions(buttons));
+    elements.extend(button_grid(buttons, 3));
 
     // 5. 我决定了 / 已就绪 按钮
     let my_pick = game
@@ -401,7 +401,7 @@ pub fn build_seer_night_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "primary",
     );
-    elements.push(actions(buttons));
+    elements.extend(button_grid(buttons, 3));
     elements.push(note("仅你可见"));
     card(
         header_with_subtitle(
@@ -499,7 +499,7 @@ pub fn build_witch_night_card(game: &WolfGame, viewer: &Player) -> Value {
             None,
             "danger",
         );
-        elements.push(actions(pbuttons));
+        elements.extend(button_grid(pbuttons, 3));
         elements.push(note("毒和救只能二选一 · 仅你可见"));
     } else {
         elements.push(note("毒药已用 · 仅你可见"));
@@ -620,7 +620,8 @@ pub fn build_sheriff_vote_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "primary",
     );
-    elements.push(actions(buttons));
+    // 候选 ≥ 6 时按钮挤成一坨；按 3 个一行换行渲染。
+    elements.extend(button_grid(buttons, 3));
     let v_abs = json!({
         "chat_id": game.chat_id,
         "game": game.game_count,
@@ -879,7 +880,8 @@ pub fn build_vote_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "primary",
     );
-    elements.push(actions(buttons));
+    // 8-12 人候选挤一行很难看，按 3 个一行换行渲染。
+    elements.extend(button_grid(buttons, 3));
 
     let v_abs = json!({
         "chat_id": game.chat_id,
@@ -958,7 +960,7 @@ pub fn build_hunter_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "danger",
     );
-    elements.push(actions(buttons));
+    elements.extend(button_grid(buttons, 3));
 
     let v_skip = json!({
         "chat_id": game.chat_id,
@@ -1018,7 +1020,7 @@ pub fn build_badge_pass_card(game: &WolfGame, viewer: &Player) -> Value {
         None,
         "primary",
     );
-    elements.push(actions(buttons));
+    elements.extend(button_grid(buttons, 3));
     let v_destroy = json!({
         "chat_id": game.chat_id,
         "game": game.game_count,

@@ -317,10 +317,21 @@ impl Bot {
             let game = games
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Game::new(chat_id.to_string()));
-            // Number new AI seats sequentially per table.
-            let n = game.players.iter().filter(|p| p.is_ai).count() + 1;
+            // AI 名字后缀用座位号（1-indexed），跟人类玩家穿插坐时也对得上：
+            // 之前用『AI 数 +1』在『AI / AI / 人类 / AI』这种排列里，
+            // 第 4 个座位的 AI 会被叫成 #3，AI 们互相称呼就乱套了。
+            let n = game.players.len() + 1;
+            // ai_id 用全局递增 unique 值——不能跟座位号 / # 后缀绑（人离场
+            // 重排会让旧 ai_id 撞车）。从已有 ai:* id 里找最大数 +1。
+            let unique = game
+                .players
+                .iter()
+                .filter_map(|p| p.open_id.strip_prefix("ai:").and_then(|s| s.parse::<u32>().ok()))
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1);
             let persona = Persona::random();
-            let ai_id = format!("ai:{}", n);
+            let ai_id = format!("ai:{}", unique);
             let ai_name = format!("{} #{}", persona.label(), n);
             game.add_ai_player(ai_id, ai_name, persona)?;
             self.persist_locked(chat_id, game);

@@ -208,6 +208,17 @@ pub fn actions(buttons: Vec<Value>) -> Value {
     button_row(buttons)
 }
 
+/// 按钮太多时按 `per_row` 分块，每块包成一个 column_set。给投票 / 选目标
+/// 这种候选 ≥ 6 个的场景用——纯 `flex_mode: "flow"` 在飞书上常常一行硬塞。
+/// 用法：返回多个 row（直接全部 push 进 elements）。
+pub fn button_grid(buttons: Vec<Value>, per_row: usize) -> Vec<Value> {
+    let per_row = per_row.max(1);
+    buttons
+        .chunks(per_row)
+        .map(|chunk| button_row(chunk.to_vec()))
+        .collect()
+}
+
 // ---------- form + input ----------
 
 pub fn form(name: &str, elements: Vec<Value>) -> Value {
@@ -226,7 +237,9 @@ pub fn input_field(name: &str, placeholder: &str, default_value: &str, label: &s
         "default_value": default_value,
         "label": { "tag": "plain_text", "content": label },
         "label_position": "left",
-        "max_length": 10,
+        // 1000 是飞书 input 组件允许的最大字数；不写 max_length 会按默认 100。
+        // 狼人杀发言 / 遗言可能比较长，给到上限。
+        "max_length": 1000,
         "input_type": "text",
         "width": "fill",
     })
