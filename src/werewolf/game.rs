@@ -1006,11 +1006,12 @@ impl WolfGame {
                 player: *idx,
                 cause: *cause,
             });
+            // 公告中性化：不暴露 狼刀 vs 毒杀 的差别——这是黑信息，
+            // 只有动手的角色（狼 / 女巫）通过自己的内部状态知道真因。
             self.event_log.push(format!(
-                "第 {} 夜：{} {}",
+                "第 {} 夜：{} 死亡",
                 self.day,
                 self.players[*idx].name,
-                cause.label()
             ));
         }
 
@@ -1870,14 +1871,16 @@ impl WolfGame {
                 player: t,
                 cause: DeathCause::HunterShot,
             });
+            // 公告中性化：不标记 猎人 / 狼王 角色（狼王惯例伪装成猎人），
+            // 与公开广播卡片保持一致。
             self.event_log.push(format!(
-                "猎人 {} 开枪带走 {}",
+                "{} 临死前开枪带走 {}",
                 self.players[h_idx].name, self.players[t].name
             ));
             shot_idx = Some(t);
         } else {
             self.event_log
-                .push(format!("猎人 {} 选择不开枪", self.players[h_idx].name));
+                .push(format!("{} 选择不开枪", self.players[h_idx].name));
         }
         self.recap_log.push(RecapEvent::HunterShot {
             day: self.day,

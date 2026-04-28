@@ -15,6 +15,7 @@ use crate::llm::LlmClient;
 use crate::werewolf::game::*;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use tracing::warn;
 
 // ============================================================================
@@ -40,53 +41,69 @@ pub struct PublicView<'a> {
     /// **本玩家自己**的所有公开发言（按时间顺序），从 recap_log 提取。
     /// 给后续决策提供"我说过什么"的强信号——避免发言和实际行动冲突。
     pub my_statements: Vec<String>,
+    /// 结构化复盘日志（公开 + 私有事件都在内）。render() 时只展示公开部分，
+    /// 用来构造每位玩家的发言 + 投票档案，比 event_log 的扁平文本更易解析。
+    pub recap_log: &'a [RecapEvent],
 }
 
 impl<'a> PublicView<'a> {
     /// 标准上下文段落，给所有 prompt 用。
     fn render(&self) -> String {
-        let players_str: Vec<String> = self
-            .players
-            .iter()
-            .map(|(_, n, alive)| {
-                if *alive {
-                    format!("{} (存活)", n)
-                } else {
-                    format!("{} (出局)", n)
-                }
-            })
-            .collect();
-        let mut out = format!(
+        let mut out = String::new();
+
+        // === Header: 局面 ===
+        out.push_str(&format!(
             "## 局面\n\
              第 {} 天 · 阶段：{}\n\
-             你是 **{}**，身份 **{}**\n\
-             场上玩家：{}\n",
+             你是 **{} 号位 {}**，身份 **{}**\n",
             self.day,
             self.stage_label,
+            self.me_idx,
             self.me_name,
             self.me_role.label(),
-            players_str.join(" · ")
-        );
+        ));
+
+        // 玩家列表（带 idx 前缀，区分同名 AI）
+        let alive_str: Vec<String> = self
+            .players
+            .iter()
+            .filter(|(_, _, a)| *a)
+            .map(|(i, n, _)| format!("{} 号 {}", i, n))
+            .collect();
+        let dead_str: Vec<String> = self
+            .players
+            .iter()
+            .filter(|(_, _, a)| !*a)
+            .map(|(i, n, _)| format!("{} 号 {}", i, n))
+            .collect();
+        out.push_str(&format!("存活：{}\n", alive_str.join(" · ")));
+        if !dead_str.is_empty() {
+            out.push_str(&format!("出局：{}\n", dead_str.join(" · ")));
+        }
+
         if !self.teammates.is_empty() {
             let names: Vec<String> = self
                 .teammates
                 .iter()
-                .map(|(_, n, role)| format!("{} ({})", n, role))
+                .map(|(i, n, role)| format!("{} 号 {} ({})", i, n, role))
                 .collect();
-            out.push_str(&format!("狼队友：{}\n", names.join("、")));
+            out.push_str(&format!("【狼队友】{}\n", names.join("、")));
         }
+
+        // === 你的查验（仅预言家自己看得到，含狼王也显示为狼人）===
         if !self.seer_log.is_empty() {
-            out.push_str("\n你之前查验过：\n");
+            out.push_str("\n## 🔮 你的查验记录\n");
             for (d, n, w) in &self.seer_log {
                 out.push_str(&format!(
-                    "  第 {} 夜：{} 是 {}\n",
+                    "  第 {} 夜 · {} → **{}**\n",
                     d,
                     n,
                     if *w { "狼人" } else { "好人" }
                 ));
             }
         }
-        // 把"自己说过什么"放在事件历史前面 + 显眼，强化前后一致性
+
+        // === 你的公开发言（强化前后一致性）===
         if !self.my_statements.is_empty() {
             out.push_str("\n## ⚡ 你之前的公开发言（保持一致！前后矛盾会暴露你）\n");
             for s in &self.my_statements {
@@ -95,15 +112,210 @@ impl<'a> PublicView<'a> {
                 out.push('\n');
             }
         }
+
+        // === 玩家档案（每位玩家的发言 + 投票轨迹，按 idx 排序）===
+        let dossiers = self.build_dossiers();
+        let any_lines = dossiers.iter().any(|(_, _, _, lines)| !lines.is_empty());
+        if any_lines {
+            out.push_str("\n## 📒 玩家档案（每人公开发言 + 投票轨迹，是判读真假的核心信号）\n");
+            for (idx, name, alive, lines) in &dossiers {
+                if lines.is_empty() {
+                    continue;
+                }
+                let status = if *alive { "存活" } else { "出局" };
+                let me_marker = if *idx == self.me_idx { "  ← 你" } else { "" };
+                out.push_str(&format!(
+                    "\n### {} 号 {}（{}）{}\n",
+                    idx, name, status, me_marker
+                ));
+                for line in lines {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+
+        // === 事件历史（按时间，作为档案的补充）===
         if !self.event_log.is_empty() {
-            out.push_str("\n## 事件历史\n");
+            out.push_str("\n## 📜 事件历史（按时间）\n");
             for line in self.event_log {
                 out.push_str("  ");
                 out.push_str(line);
                 out.push('\n');
             }
         }
+
         out
+    }
+
+    /// 名字辅助：从 idx 拿出玩家名。
+    fn player_name(&self, idx: usize) -> Option<&str> {
+        self.players
+            .iter()
+            .find(|(i, _, _)| *i == idx)
+            .map(|(_, n, _)| n.as_str())
+    }
+
+    /// 从 recap_log 提取每位玩家的公开档案（发言 / 投票 / 死讯 / 警徽 / 开枪）。
+    /// 仅含**对所有人公开**的事件——夜间私密事件（守、狼刀、查验、女巫）不放进去；
+    /// 死亡时夜间死因（狼刀 / 毒）也会被脱敏成『夜里死亡』，避免泄露动手的角色身份。
+    ///
+    /// 返回 `(idx, name, alive, lines)`，按 idx 排序。
+    fn build_dossiers(&self) -> Vec<(usize, String, bool, Vec<String>)> {
+        let mut by_player: HashMap<usize, Vec<String>> = HashMap::new();
+
+        // 已结算的白天（DayLynch 已写入）—— 这些天的投票才公开，
+        // 当天还在进行中的投票（DayVote 阶段）不能让下一个投票的 AI 偷看。
+        let resolved_lynch_days: std::collections::HashSet<u32> = self
+            .recap_log
+            .iter()
+            .filter_map(|e| match e {
+                RecapEvent::DayLynch { day, .. } => Some(*day),
+                _ => None,
+            })
+            .collect();
+
+        for evt in self.recap_log {
+            match evt {
+                RecapEvent::SheriffSpeech { player, text } => {
+                    by_player
+                        .entry(*player)
+                        .or_default()
+                        .push(format!("【上警发言】{}", text));
+                }
+                RecapEvent::SheriffSideSpeech { player, text } => {
+                    by_player
+                        .entry(*player)
+                        .or_default()
+                        .push(format!("【警下发言】{}", text));
+                }
+                RecapEvent::DaySpeech { day, player, text } => {
+                    by_player
+                        .entry(*player)
+                        .or_default()
+                        .push(format!("【D{} 发言】{}", day, text));
+                }
+                RecapEvent::DayVoteCast {
+                    day, voter, target, ..
+                } => {
+                    if !resolved_lynch_days.contains(day) {
+                        // 当天投票未结算 —— 个体票面尚未公开，跳过。
+                        continue;
+                    }
+                    let target_str = match target {
+                        Some(t) => format!(
+                            "{} 号 {}",
+                            t,
+                            self.player_name(*t).unwrap_or("?")
+                        ),
+                        None => "弃权".to_string(),
+                    };
+                    by_player
+                        .entry(*voter)
+                        .or_default()
+                        .push(format!("【D{} 投票 →】{}", day, target_str));
+                }
+                RecapEvent::LastWords {
+                    day,
+                    night,
+                    player,
+                    text,
+                } => {
+                    let label = if *night {
+                        format!("D{} 夜遗言", day)
+                    } else {
+                        format!("D{} 放逐遗言", day)
+                    };
+                    by_player
+                        .entry(*player)
+                        .or_default()
+                        .push(format!("【{}】{}", label, text));
+                }
+                RecapEvent::HunterShot {
+                    day,
+                    shooter,
+                    target,
+                } => {
+                    let target_str = match target {
+                        Some(t) => format!(
+                            "带走 {} 号 {}",
+                            t,
+                            self.player_name(*t).unwrap_or("?")
+                        ),
+                        None => "选择不开枪".to_string(),
+                    };
+                    by_player
+                        .entry(*shooter)
+                        .or_default()
+                        .push(format!("【D{} 临死开枪】{}", day, target_str));
+                }
+                RecapEvent::BadgePass { day, from, to } => {
+                    let target_str = match to {
+                        Some(t) => format!(
+                            "传给 {} 号 {}",
+                            t,
+                            self.player_name(*t).unwrap_or("?")
+                        ),
+                        None => "撕毁".to_string(),
+                    };
+                    by_player
+                        .entry(*from)
+                        .or_default()
+                        .push(format!("【D{} 警徽】{}", day, target_str));
+                }
+                // 夜间私密事件（守 / 狼刀 / 查验 / 女巫）—— 不进档案，
+                // 因为档案是给所有 AI 看的，不能泄露他人身份。
+                _ => {}
+            }
+        }
+
+        // 死讯单独插到档案最前面，便于一眼看到该玩家是不是已经出局。
+        // 夜间狼刀/毒杀脱敏为『夜里死亡』——只有动手者通过自己的状态知道真因，
+        // 其他玩家不该从死因里反推出谁是狼 / 谁是女巫。
+        for evt in self.recap_log {
+            if let RecapEvent::Death {
+                day,
+                night,
+                player,
+                cause,
+            } = evt
+            {
+                let label = if *night {
+                    format!("D{} 夜", day)
+                } else {
+                    format!("D{} 白天", day)
+                };
+                let cause_str = self.cause_label_for_view(*cause, *night);
+                let entry = by_player.entry(*player).or_default();
+                entry.insert(0, format!("☠ 【{}】{}", label, cause_str));
+            }
+        }
+
+        let mut out: Vec<_> = self
+            .players
+            .iter()
+            .map(|(i, n, alive)| {
+                let lines = by_player.remove(i).unwrap_or_default();
+                (*i, n.clone(), *alive, lines)
+            })
+            .collect();
+        out.sort_by_key(|(i, _, _, _)| *i);
+        out
+    }
+
+    /// 给档案 / 事件历史用的死因标签。夜间的 狼刀 / 毒杀 脱敏为『夜里死亡』，
+    /// 避免泄露『有女巫毒过 X』『今晚是空刀还是狼刀』等私密信息。
+    /// 白天死讯（放逐 / 开枪）和夜间开枪都是公开广播，照原样显示。
+    fn cause_label_for_view(&self, cause: DeathCause, night: bool) -> &'static str {
+        if night {
+            match cause {
+                DeathCause::WolfKill | DeathCause::Poison => "夜里死亡",
+                _ => cause.label(),
+            }
+        } else {
+            cause.label()
+        }
     }
 }
 
@@ -137,7 +349,6 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
     };
 
     // 自己的公开发言历史，从 recap_log 提取（结构化，不依赖文本匹配）
-    use crate::werewolf::game::RecapEvent;
     let my_statements: Vec<String> = game
         .recap_log
         .iter()
@@ -185,6 +396,7 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         seer_log,
         event_log: &game.event_log,
         my_statements,
+        recap_log: &game.recap_log,
     }
 }
 
@@ -224,16 +436,23 @@ async fn chat_with_history(
 // ============================================================================
 
 fn persona_line(persona: Option<Persona>) -> String {
+    let preamble = "## 高玩思考守则（每次决策都要遵循）\n\
+                    1. **优先看『玩家档案』** —— 每人发言+投票轨迹是真实信号，事件历史是嘈杂快照；先把每位玩家的脉络读完再下判断。\n\
+                    2. **多人跳同一神职 = 必有狼**（如两个预言家、两个女巫）。你必须**选边并给出理由**，不能和稀泥。\n\
+                    3. **拒绝跟票** —— 大多数人投谁不代表他真是狼。狼最爱用群体节奏掩护队友；如果场上正在向某个目标聚拢，先反问『这个目标真是狼吗，还是被狼带节奏？』\n\
+                    4. **保持流派烙印** —— 发言/投票/站警的风格要让人一眼读出你的流派；别打成模板化的『我觉得 X 有点像狼但也说不准』。\n\
+                    5. **逻辑要可反驳** —— 给出可验证的理由（基于具体玩家、具体发言、具体投票），让后面的人能接着推/驳；这样才打得起来一局好局。\n\
+                    6. **思考要深** —— 在 thinking 字段里写完整推理（你看到了什么、你信谁、你为什么这么投/这么说）；这是你高玩底牌的证明。\n\n";
     match persona {
         Some(p) => format!(
-            "## 你的高玩档案：**{}**\n{}\n\n\
+            "{}## 你的高玩档案：**{}**\n{}\n\n\
              这是你的流派烙印——你的发言、投票、站警、跳身份的所有决策都要让其他玩家\
-             从行为里**读得出你是这个流派的高玩**。不是娱乐玩家，是有套路、能算几层的人。\
-             不要打成模板化、套话型的均衡 AI（如『我觉得 X 有点像狼但也说不准』那种没立场的话）——风格越鲜明越好。",
+             从行为里**读得出你是这个流派的高玩**。不是娱乐玩家，是有套路、能算几层的人。",
+            preamble,
             p.label(),
             p.werewolf_description()
         ),
-        None => "你没有特定流派，按一般直觉决策。".into(),
+        None => format!("{}你没有特定流派，按一般直觉决策。", preamble),
     }
 }
 
@@ -607,15 +826,26 @@ pub async fn vote_pick(
     };
 
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，正在白天投票阶段。你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
+        "你是飞书群里玩狼人杀的高水平玩家，正在白天投票阶段。你的真实身份是 **{}**。{}\n\
+         {}\n\n{}\n\n## 投票任务\n\
          投票放逐你认为应该被处决的玩家，或弃权 (target_idx = -1)。\
          不能投自己。**只投票，不发言**——发言阶段已经结束。\n\n\
-         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"...\"}}",
+         ## 高玩投票守则\n\
+         1. **绝不无脑跟票** —— 看完『玩家档案』再下判断。狼最爱用群体节奏掩护队友。\
+            如果场上多数票指向某人，先反问：我从档案里**真的看到他像狼吗**？还是只是大家说他像？\n\
+         2. **预言家冲突要选边** —— 跳预言家的≥2 人时，必有一狼，不能弃权也不能乱投，要选你信的那个。\n\
+         3. **错投代价**：好人错投一票 = 把队友送出局，狼直接得分；狼错投 = 暴露身份。\n\
+         4. **你是 {}（{} 流派）** —— 投票决策也要符合你的流派判读模式：\
+            悍跳激进流投关键票时绝不犹豫；逻辑推理流投票要给出最严密的链条；\
+            节奏控场流通过投票配合自己之前的发言；静水深流保留信息一击致命；反水诡道流反向操作出乎意料。\n\
+         5. **弃权 = 浪费票权** —— 除非真的看不清，否则别弃权。\n\n\
+         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理：你扫过哪几个人、信谁、为什么投这个/弃权>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
-        RULES
+        RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands_str: Vec<String> = candidates
         .iter()
@@ -870,15 +1100,23 @@ pub async fn sheriff_vote(
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，正在警长投票阶段。\
+        "你是飞书群里玩狼人杀的高水平玩家，正在警长投票阶段。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         在候选人中投出你支持的警长，或弃权 (target_idx = -1)。候选人不能投票（包含你自己若是候选人）。\n\n\
-         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"...\"}}",
+         {}\n\n{}\n\n## 警长投票任务\n\
+         - 在候选人中投出你支持的警长，或弃权 (target_idx = -1)。\n\
+         - 候选人不能投票（包含你自己若是候选人）。\n\n\
+         ## 高玩警长投票守则\n\
+         1. 这一票决定开局节奏：警长有 1.5x 票权 + 决定白天发言方向 + 警徽流转。\n\
+         2. 看『玩家档案』里候选人的上警发言：你信谁？跳预言家冲突时**必须选边**。\n\
+         3. 阵营立场：好人投真神职 / 真好人；狼投己方狼 / 投假预言家把警徽夺到狼方。\n\
+         4. **绝不无脑跟随大流** —— 别人投谁不代表他真该上。\n\
+         5. 流派烙印：你是 {} —— 决策方式要符合该流派。\n\n\
+         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands: Vec<String> = candidates
         .iter()
@@ -996,16 +1234,27 @@ pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，现在是第 1 天上警阶段，你正在做竞选发言。\
+        "你是飞书群里玩狼人杀的高水平玩家，现在是第 1 天上警阶段，你正在做竞选发言。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         发表一段竞选发言，会公开广播给所有玩家。\n\
-         风格：群聊语气、自然口语、≤ 80 字、一段话。\n\n\
-         返回 JSON: {{\"speech\": \"<发言内容>\", \"thinking\": \"...\"}}",
+         {}\n\n{}\n\n## 上警发言任务\n\
+         - 发表一段公开广播的竞选发言。\n\
+         - 风格：群聊语气、自然口语、≤ 80 字、一段话。\n\n\
+         ## 这是博弈的开局，你必须做的事\n\
+         1. 上警 = **押注立场**：要么报身份（预言家通常此时跳，狼也常悍跳），要么以村民身份立场强硬上去抢警徽（1.5x 票权）。\n\
+         2. 你的真实身份是 **{}**（{} 流派）—— 决定你这把『跳什么 / 怎么跳』：\n\
+            - 真预言家：上来报昨夜查验（必报），否则警徽被狼夺走全场被带歪。\n\
+            - 狼/狼王：考虑悍跳预言家（编造查验），把真预言家压回去；或装村民暗中投票配合狼队。\n\
+            - 女巫/猎人/守卫：神职上警通常不报身份（避免被狼夜杀），但要展现可信逻辑。\n\
+            - 普通村民：上警靠表态强硬，把警徽留在好人手里。\n\
+         3. 流派决定**风格**：悍跳激进流敢编敢喷；逻辑推理流不靠嗓门靠链条；节奏控场流梳理共识；静水深流话少分量重；反水诡道流敢反向开炮。\n\
+         4. **不要说空话** —— 每一句都要带可验证的内容（具体玩家、具体观察、具体押注）。\n\n\
+         返回 JSON: {{\"speech\": \"<发言, ≤80 字>\", \"thinking\": \"<你为何上警、跳什么身份、怎么打这一局>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
@@ -1037,16 +1286,24 @@ pub async fn sheriff_side_speech(llm: &LlmClient, view: &PublicView<'_>) -> Stri
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，正在警下发言阶段（非候选人对警上候选人表态）。\
+        "你是飞书群里玩狼人杀的高水平玩家，正在警下发言阶段（非候选人对警上候选人表态）。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         对警上候选人发表你的看法，会公开广播。\n\
-         风格：群聊语气、≤ 60 字、一段话；可空 (沉默)。\n\n\
-         返回 JSON: {{\"speech\": \"<发言>\", \"thinking\": \"...\"}}",
+         {}\n\n{}\n\n## 警下发言任务\n\
+         - 对警上候选人发表你的看法，会公开广播。\n\
+         - 风格：群聊语气、≤ 60 字、一段话；可空 (沉默) 但代价高。\n\n\
+         ## 高玩警下发言要点\n\
+         1. 你不能上警，但你的发言会被警长候选人听到、被全场记住，**也会影响警长投票**。\n\
+         2. 看『玩家档案』里几位候选人的上警发言：哪个的逻辑更可信？\n\
+            如果有≥2 跳预言家，必有一狼，警下发言就是站边的关键时机。\n\
+         3. 你是 {}（{} 流派）—— 流派决定你怎么表态（悍跳激进 vs 静水深流的输出截然不同）。\n\
+         4. **拒绝套话** —— 『支持平和过渡』『听大家的』这种废话不如不说。\n\n\
+         返回 JSON: {{\"speech\": \"<发言, ≤60 字, 必须有可验证立场>\", \"thinking\": \"<你的判断依据>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
@@ -1115,16 +1372,25 @@ pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> String {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，**你刚刚死亡，正在发表遗言**。\
+        "你是飞书群里玩狼人杀的高水平玩家，**你刚刚死亡，正在发表遗言**。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         发表你的遗言，会公开广播。\n\
-         风格：群聊语气、≤ 100 字；可空（沉默）。\n\n\
-         返回 JSON: {{\"speech\": \"<遗言>\", \"thinking\": \"...\"}}",
+         {}\n\n{}\n\n## 遗言任务\n\
+         - 发表你的遗言，会公开广播给所有玩家。\n\
+         - 风格：群聊语气、≤ 100 字；可空（沉默）但代价高。\n\n\
+         ## 高玩遗言要点\n\
+         1. 遗言是**最后一次留信号**给己方。死人也能左右场上推理。\n\
+         2. 真预言家被刀：遗言必须报全部查验 + 推荐警长接班 / 投谁。\n\
+         3. 真神职被刀：可选择是否报身份 + 给好人留一个推理方向。\n\
+         4. 好人被刀（村民）：用观察到的发言矛盾给出推理结论。\n\
+         5. 狼被刀（罕见）：遗言可继续误导（嫁祸 / 卖队友求信任）。\n\
+         6. 你是 {}（{} 流派）—— 遗言风格要保持流派烙印。\n\n\
+         返回 JSON: {{\"speech\": \"<遗言, ≤100 字, 信息密度要高>\", \"thinking\": \"<你想留下什么信号>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
@@ -1189,7 +1455,7 @@ pub async fn dying_hunter_combined(
     };
 
     let system = format!(
-        "你是飞书群里的狼人杀玩家，扮演 **{}**，刚刚死亡。{}\n\
+        "你是飞书群里的狼人杀高水平玩家，扮演 **{}**，刚刚死亡。{}\n\
          {}\n\n{}\n\n## 任务（一次性两件事）\n\
          1. **遗言**（公开广播给所有玩家）\n\
          2. **开枪**：可选一名存活的非自己玩家带走 (target_idx = idx)，\
@@ -1200,11 +1466,17 @@ pub async fn dying_hunter_combined(
          - 如果遗言里嫁祸 / 留给场上推理，开枪选择应当配合那个叙事\n\n\
          注：公开广播只显示『X 临死前开枪带走 Y』或『X 选择不开枪』，**不会标记你的身份**\
          （猎人和狼王共享开枪技能，狼王惯例伪装成猎人）。\n\n\
-         返回 JSON: {{\"speech\": \"<遗言, ≤100 字>\", \"target_idx\": <整数 idx 或 -1>, \"thinking\": \"...\"}}",
+         ## 高玩开枪决策\n\
+         - 看『玩家档案』：你最确定是狼的人是谁？开枪带走他/她。\n\
+         - 如果你毫无把握，**带走最像狼的人比不开枪好**（不开枪 = 浪费技能）。\n\
+         - 你是 {}（{} 流派）—— 开枪选择也要符合流派烙印（悍跳激进流敢决断、逻辑推理流给出严密链条、反水诡道流可反手带走己方狼伪装好人，等等）。\n\n\
+         返回 JSON: {{\"speech\": \"<遗言, ≤100 字>\", \"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理：为何带走这个/不开枪>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands: Vec<String> = candidates
         .iter()
@@ -1265,16 +1537,29 @@ pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的玩家，现在是白天，轮到你发言（一次性单次发言，提交后回合结束）。\
+        "你是飞书群里玩狼人杀的高水平玩家，现在是白天，轮到你发言（一次性单次发言，提交后回合结束）。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         发表你的看法，会公开广播。\n\
-         风格：群聊语气、自然口语、≤ 80 字、一段话；可空 (沉默)。\n\n\
-         返回 JSON: {{\"speech\": \"<发言内容>\", \"thinking\": \"...\"}}",
+         {}\n\n{}\n\n## 你的发言任务\n\
+         - 发表一段公开广播给全场的看法。\n\
+         - 风格：群聊语气、自然口语、≤ 80 字、一段话；可空 (沉默) 但代价高。\n\n\
+         ## 这一刻你必须做的事（按顺序在 thinking 里走一遍）\n\
+         1. 把『玩家档案』里的每个存活玩家过一遍：他们都说过什么、投过谁？\n\
+         2. 是否存在跳神职冲突？谁的逻辑链更可信？\n\
+         3. 有没有人这一天还没发过言？没说话的玩家是更难分析（信息少），但也是潜在突破点。\n\
+         4. 我作为 **{}**（{} 流派），说出哪种话**最大化我方利益**？——\n\
+            - 如果你是预言家：你的查验信息是最强武器，是否报、何时报、报哪个？\n\
+            - 如果你是女巫/猎人/守卫：神职身份要不要暴露？藏起来更好还是亮出来逼狼？\n\
+            - 如果你是村民：你没确定信息，靠**指出别人逻辑的漏洞**找狼。\n\
+            - 如果你是狼/狼王：你的敌人是好人神职。装好人 / 带节奏 / 反咬狼队友 / 悍跳预言家——按你的流派选。\n\
+         5. 我说出的话能否被其他玩家**反驳或验证**？空话（『我感觉 X 像狼』）等于没说。\n\
+         6. **拒绝跟风**：如果场上正在向某人聚拢攻击，是不是被狼带节奏了？\n\n\
+         返回 JSON: {{\"speech\": \"<发言, ≤80 字, 必须有可验证逻辑>\", \"thinking\": \"<你完整的推理：扫了哪几个人、信谁、为什么这么说>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
+        view.me_role.label(),
+        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
