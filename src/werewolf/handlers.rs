@@ -1843,18 +1843,18 @@ impl Bot {
                                 .collect()
                         };
                         for (oid, existing) in humans_pending {
+                            // 投票卡是静态的（候选不变，看不到别人怎么投）—— 发过一次
+                            // 就别再发了。advance_wolf 每次有人投完都会进这条路径，
+                            // 重发会刷屏。
+                            if existing.is_some() {
+                                continue;
+                            }
                             let card = {
                                 let games = self.wolf_games.lock();
                                 let Some(g) = games.get(chat_id) else { return };
                                 let Some(p_idx) = g.find_player(&oid) else { continue };
                                 build_vote_card(g, &g.players[p_idx])
                             };
-                            // 已有卡 → 尝试 update；失败回落到重发
-                            if let Some(msg_id) = &existing {
-                                if self.client.update_card(msg_id, &card).await.is_ok() {
-                                    continue;
-                                }
-                            }
                             if let Ok(new_id) = self
                                 .client
                                 .send_ephemeral_card(chat_id, &oid, &card)
@@ -2140,11 +2140,10 @@ impl Bot {
             (card, existing)
         };
 
-        if let Some(msg_id) = existing_msg_id {
-            if self.client.update_card(&msg_id, &card).await.is_ok() {
-                return;
-            }
-            // update 失败（卡可能被删了），重发新卡
+        // ephemeral 卡片不能用 PATCH 更新，必须 delete 旧的 + send 新的，
+        // 否则每次状态变更都堆一张新卡刷屏。失败也不致命（旧卡留着，看着不爽但不会卡逻辑）。
+        if let Some(old_id) = &existing_msg_id {
+            let _ = self.client.delete_ephemeral(old_id).await;
         }
         match self
             .client
@@ -2507,10 +2506,9 @@ impl Bot {
             let c = build_last_words_private_card(g, &g.players[speaker_idx]);
             (c, g.last_words_private_msg.clone())
         };
-        if let Some(msg_id) = existing_msg {
-            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
-                return;
-            }
+        // ephemeral 不能 PATCH：先删后发
+        if let Some(old) = &existing_msg {
+            let _ = self.client.delete_ephemeral(old).await;
         }
         if let Ok(new_id) = self
             .client
@@ -2568,10 +2566,9 @@ impl Bot {
             (c, existing)
         };
 
-        if let Some(msg_id) = existing_msg {
-            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
-                return;
-            }
+        // ephemeral 不能 PATCH：先删后发
+        if let Some(old) = &existing_msg {
+            let _ = self.client.delete_ephemeral(old).await;
         }
         match self
             .client

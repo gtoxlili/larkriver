@@ -131,6 +131,27 @@ impl Client {
             .to_string())
     }
 
+    /// 删除一张 ephemeral 卡片。ephemeral 卡片（om_x 前缀的 message_id）
+    /// 不能用标准 PATCH /im/v1/messages/{id} 接口更新——会返回 230001
+    /// invalid message_id。所以更新一张 ephemeral 必须 delete 旧的 + send 新的。
+    pub async fn delete_ephemeral(&self, message_id: &str) -> Result<()> {
+        let token = self.tenant_access_token().await?;
+        let body = serde_json::json!({ "message_id": message_id });
+        let resp: Value = self
+            .http
+            .post("https://open.feishu.cn/open-apis/ephemeral/v1/delete")
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp["code"].as_i64().unwrap_or(-1) != 0 {
+            return Err(anyhow!("delete_ephemeral failed: {resp}"));
+        }
+        Ok(())
+    }
+
     /// Replace an interactive card's content.
     pub async fn update_card(&self, message_id: &str, card: &Value) -> Result<()> {
         let token = self.tenant_access_token().await?;
