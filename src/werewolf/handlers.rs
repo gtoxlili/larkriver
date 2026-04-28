@@ -1182,7 +1182,7 @@ impl Bot {
                         continue;
                     }
 
-                    // 混合 / 全人类：先发卡给人类，AI 之后顺序行动
+                    // 混合 / 全人类：先发卡给人类
                     if has_humans {
                         let humans: Vec<(usize, String)> = {
                             let games = self.wolf_games.lock();
@@ -1196,6 +1196,21 @@ impl Bot {
                         for (wolf_idx, oid) in humans {
                             self.send_or_update_wolf_night_card(chat_id, wolf_idx, &oid).await;
                         }
+                    }
+
+                    // **人类优先**：所有人类狼都点了"我决定了"之前，AI 不动手。
+                    // 否则 AI 会瞬间投完票 / 抢先在狼频道发言，人类玩家根本来不及
+                    // 思考 / 讨论 / 改主意。等全部人类就绪再让 AI 顺序决策。
+                    let any_human_pending = {
+                        let games = self.wolf_games.lock();
+                        let Some(g) = games.get(chat_id) else { return };
+                        g.alive_wolves().into_iter().any(|w| {
+                            !g.players[w].is_ai && !g.is_wolf_ready(w)
+                        })
+                    };
+                    if any_human_pending {
+                        // 卡片已发，等人类点 [我决定了] 触发下一次 advance_wolf
+                        return;
                     }
 
                     // AI 顺序决策（每只 AI 提交目标 + 可选发言）
