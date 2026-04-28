@@ -20,10 +20,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// 三种顺序发言的语义区分。
+/// 两种顺序发言的语义区分。
 enum SpeechKind {
     SheriffMain,
-    SheriffSide,
     Day,
 }
 
@@ -249,19 +248,6 @@ impl Bot {
                 self.submit_speech_and_advance(&chat_id, &action.open_id, String::new(), false)
                     .await
             }
-            "wolf_sheriff_side_submit" => {
-                let speech = action
-                    .form_value
-                    .get("speech")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                self.submit_sheriff_side_and_advance(&chat_id, &action.open_id, speech).await
-            }
-            "wolf_sheriff_side_skip" => {
-                self.submit_sheriff_side_and_advance(&chat_id, &action.open_id, String::new())
-                    .await
-            }
             "wolf_last_words_submit" => {
                 let speech = action
                     .form_value
@@ -467,34 +453,6 @@ impl Bot {
             bot.advance_wolf(&cid).await;
         });
         Ok(toast("已确认"))
-    }
-
-    async fn submit_sheriff_side_and_advance(
-        self: &std::sync::Arc<Self>,
-        chat_id: &str,
-        speaker_open_id: &str,
-        speech: String,
-    ) -> Result<Value> {
-        let res = {
-            let mut games = self.wolf_games.lock();
-            let Some(g) = games.get_mut(chat_id) else {
-                return Ok(toast("游戏不存在"));
-            };
-            let r = g.submit_sheriff_side_speech(speaker_open_id, speech);
-            if r.is_ok() {
-                self.persist_wolf_locked(chat_id, g);
-            }
-            r
-        };
-        if let Err(e) = res {
-            return Ok(toast(&format!("{e}")));
-        }
-        let bot = self.clone();
-        let cid = chat_id.to_string();
-        tokio::spawn(async move {
-            bot.advance_wolf(&cid).await;
-        });
-        Ok(toast("发言已提交"))
     }
 
     async fn submit_last_words_and_advance(
@@ -1677,48 +1635,6 @@ impl Bot {
                     }
                 }
 
-                Stage::SheriffSideSpeech => {
-                    self.refresh_speech_public_kind(chat_id, SpeechKind::SheriffSide).await;
-                    let current: Option<(usize, String, bool)> = {
-                        let games = self.wolf_games.lock();
-                        let Some(g) = games.get(chat_id) else { return };
-                        g.current_sheriff_side_speaker().map(|i| {
-                            let p = &g.players[i];
-                            (i, p.open_id.clone(), p.is_ai)
-                        })
-                    };
-                    let Some((spk_idx, spk_oid, is_ai)) = current else {
-                        let mut games = self.wolf_games.lock();
-                        if let Some(g) = games.get_mut(chat_id) {
-                            if let Err(e) = g.finish_sheriff_side_speeches() {
-                                warn!(?e, "finish_sheriff_side_speeches failed, force-advancing to SheriffVote");
-                                g.stage = Stage::SheriffVote;
-                                g.sheriff_votes.clear();
-                            }
-                            self.persist_wolf_locked(chat_id, g);
-                        }
-                        continue;
-                    };
-                    if is_ai {
-                        let text = self.sheriff_side_speech_ai(chat_id, spk_idx).await;
-                        {
-                            let mut games = self.wolf_games.lock();
-                            if let Some(g) = games.get_mut(chat_id) {
-                                if let Err(e) = g.submit_sheriff_side_speech(&spk_oid, text) {
-                                    warn!(?e, %spk_oid, "submit_sheriff_side_speech failed, force-advancing");
-                                    g.sheriff_side_idx += 1;
-                                }
-                                self.persist_wolf_locked(chat_id, g);
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(600)).await;
-                    } else {
-                        self.send_or_update_sheriff_side_private(chat_id, spk_idx, &spk_oid)
-                            .await;
-                        return;
-                    }
-                }
-
                 Stage::SheriffSpeech => {
                     self.refresh_speech_public(chat_id, /* sheriff = */ true).await;
 
@@ -1736,8 +1652,9 @@ impl Bot {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
                                 if let Err(e) = g.finish_sheriff_speeches() {
-                                    warn!(?e, "finish_sheriff_speeches failed, force-advancing to SheriffSideSpeech");
-                                    g.stage = Stage::SheriffSideSpeech;
+                                    warn!(?e, "finish_sheriff_speeches failed, force-advancing to SheriffVote");
+                                    g.stage = Stage::SheriffVote;
+                                    g.sheriff_votes.clear();
                                 }
                                 self.persist_wolf_locked(chat_id, g);
                             }
@@ -2377,23 +2294,6 @@ impl Bot {
         }
     }
 
-    async fn sheriff_side_speech_ai(&self, chat_id: &str, ai_idx: usize) -> String {
-        let game = {
-            let games = self.wolf_games.lock();
-            games.get(chat_id).cloned()
-        };
-        let Some(game) = game else { return String::new() };
-        let view = wolf_llm::build_view(&game, ai_idx);
-        match &self.llm {
-            Some(llm) => {
-                let (speech, thinking) = wolf_llm::sheriff_side_speech(llm, &view).await;
-                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffSideSpeech, thinking);
-                speech
-            }
-            None => String::new(),
-        }
-    }
-
     async fn sheriff_direction_ai(&self, chat_id: &str, ai_idx: usize) -> bool {
         let game = {
             let games = self.wolf_games.lock();
@@ -2511,14 +2411,6 @@ impl Bot {
                     g.sheriff_speech_idx,
                     g.sheriff_speech_public_msg.clone(),
                 ),
-                SpeechKind::SheriffSide => (
-                    "🎙️ 警下·非候选人发言",
-                    "yellow",
-                    g.sheriff_side_order.clone(),
-                    g.sheriff_side_speeches.clone(),
-                    g.sheriff_side_idx,
-                    g.sheriff_side_public_msg.clone(),
-                ),
                 SpeechKind::Day => (
                     "🎙️ 白天·轮流发言",
                     "wathet",
@@ -2547,7 +2439,6 @@ impl Bot {
                 if let Some(g) = games.get_mut(chat_id) {
                     match kind {
                         SpeechKind::SheriffMain => g.sheriff_speech_public_msg = Some(new_id),
-                        SpeechKind::SheriffSide => g.sheriff_side_public_msg = Some(new_id),
                         SpeechKind::Day => g.day_speech_public_msg = Some(new_id),
                     }
                     self.persist_wolf_locked(chat_id, g);
@@ -2612,45 +2503,6 @@ impl Bot {
             let mut games = self.wolf_games.lock();
             if let Some(g) = games.get_mut(chat_id) {
                 g.last_words_private_msg = Some(new_id);
-                self.persist_wolf_locked(chat_id, g);
-            }
-        }
-    }
-
-    async fn send_or_update_sheriff_side_private(
-        &self,
-        chat_id: &str,
-        speaker_idx: usize,
-        speaker_open_id: &str,
-    ) {
-        let (card_value, existing_msg) = {
-            let games = self.wolf_games.lock();
-            let Some(g) = games.get(chat_id) else { return };
-            let viewer = &g.players[speaker_idx];
-            let c = build_speech_private_card(
-                g,
-                viewer,
-                "🎤 警下发言",
-                "yellow",
-                "wolf_sheriff_side_submit",
-                "wolf_sheriff_side_skip",
-                "对警上候选人的看法…",
-            );
-            (c, g.sheriff_side_private_msg.clone())
-        };
-        if let Some(msg_id) = existing_msg {
-            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
-                return;
-            }
-        }
-        if let Ok(new_id) = self
-            .client
-            .send_ephemeral_card(chat_id, speaker_open_id, &card_value)
-            .await
-        {
-            let mut games = self.wolf_games.lock();
-            if let Some(g) = games.get_mut(chat_id) {
-                g.sheriff_side_private_msg = Some(new_id);
                 self.persist_wolf_locked(chat_id, g);
             }
         }

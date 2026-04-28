@@ -59,26 +59,25 @@ impl<'a> PublicView<'a> {
         out.push_str(&format!(
             "## 局面\n\
              第 {} 天 · 阶段：{}\n\
-             你是 **{} 号位 {}**，身份 **{}**\n",
+             你是 **{}**，身份 **{}**\n",
             self.day,
             self.stage_label,
-            self.me_idx,
             self.me_name,
             self.me_role.label(),
         ));
 
-        // 玩家列表（带 idx 前缀，区分同名 AI）
+        // 玩家列表——AI 名字里已经带 #N 全局唯一，直接列名字即可
         let alive_str: Vec<String> = self
             .players
             .iter()
             .filter(|(_, _, a)| *a)
-            .map(|(i, n, _)| format!("{} 号 {}", i, n))
+            .map(|(_, n, _)| n.clone())
             .collect();
         let dead_str: Vec<String> = self
             .players
             .iter()
             .filter(|(_, _, a)| !*a)
-            .map(|(i, n, _)| format!("{} 号 {}", i, n))
+            .map(|(_, n, _)| n.clone())
             .collect();
         out.push_str(&format!("存活：{}\n", alive_str.join(" · ")));
         if !dead_str.is_empty() {
@@ -89,7 +88,7 @@ impl<'a> PublicView<'a> {
             let names: Vec<String> = self
                 .teammates
                 .iter()
-                .map(|(i, n, role)| format!("{} 号 {} ({})", i, n, role))
+                .map(|(_, n, role)| format!("{} ({})", n, role))
                 .collect();
             out.push_str(&format!("【狼队友】{}\n", names.join("、")));
         }
@@ -144,8 +143,8 @@ impl<'a> PublicView<'a> {
                 let status = if *alive { "存活" } else { "出局" };
                 let me_marker = if *idx == self.me_idx { "  ← 你" } else { "" };
                 out.push_str(&format!(
-                    "\n### {} 号 {}（{}）{}\n",
-                    idx, name, status, me_marker
+                    "\n### {}（{}）{}\n",
+                    name, status, me_marker
                 ));
                 for line in lines {
                     out.push_str("  ");
@@ -203,12 +202,6 @@ impl<'a> PublicView<'a> {
                         .or_default()
                         .push(format!("【上警发言】{}", text));
                 }
-                RecapEvent::SheriffSideSpeech { player, text } => {
-                    by_player
-                        .entry(*player)
-                        .or_default()
-                        .push(format!("【警下发言】{}", text));
-                }
                 RecapEvent::DaySpeech { day, player, text } => {
                     by_player
                         .entry(*player)
@@ -223,11 +216,7 @@ impl<'a> PublicView<'a> {
                         continue;
                     }
                     let target_str = match target {
-                        Some(t) => format!(
-                            "{} 号 {}",
-                            t,
-                            self.player_name(*t).unwrap_or("?")
-                        ),
+                        Some(t) => self.player_name(*t).unwrap_or("?").to_string(),
                         None => "弃权".to_string(),
                     };
                     by_player
@@ -257,11 +246,7 @@ impl<'a> PublicView<'a> {
                     target,
                 } => {
                     let target_str = match target {
-                        Some(t) => format!(
-                            "带走 {} 号 {}",
-                            t,
-                            self.player_name(*t).unwrap_or("?")
-                        ),
+                        Some(t) => format!("带走 {}", self.player_name(*t).unwrap_or("?")),
                         None => "选择不开枪".to_string(),
                     };
                     by_player
@@ -271,11 +256,7 @@ impl<'a> PublicView<'a> {
                 }
                 RecapEvent::BadgePass { day, from, to } => {
                     let target_str = match to {
-                        Some(t) => format!(
-                            "传给 {} 号 {}",
-                            t,
-                            self.player_name(*t).unwrap_or("?")
-                        ),
+                        Some(t) => format!("传给 {}", self.player_name(*t).unwrap_or("?")),
                         None => "撕毁".to_string(),
                     };
                     by_player
@@ -374,9 +355,6 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         .filter_map(|e| match e {
             RecapEvent::SheriffSpeech { player, text } if *player == ai_idx => {
                 Some(format!("[上警发言] {}", text))
-            }
-            RecapEvent::SheriffSideSpeech { player, text } if *player == ai_idx => {
-                Some(format!("[警下发言] {}", text))
             }
             RecapEvent::DaySpeech { player, text, day, .. } if *player == ai_idx => {
                 Some(format!("[第 {day} 天发言] {}", text))
@@ -1289,50 +1267,6 @@ pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, 
         Err(e) => {
             warn!(?e, "sheriff_speech LLM call failed");
             ("我先表态。".into(), None)
-        }
-    }
-}
-
-/// AI 警下发言（非候选人对警上候选人发表观点）。
-pub async fn sheriff_side_speech(
-    llm: &LlmClient,
-    view: &PublicView<'_>,
-) -> (String, Option<String>) {
-    let team = if view.me_role.is_wolf() {
-        "你的阵营是狼。"
-    } else {
-        "你的阵营是好人。"
-    };
-    let system = format!(
-        "你是飞书群里玩狼人杀的玩家，正在警下发言阶段（非候选人对警上候选人表态）。\
-         你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 任务\n\
-         对警上候选人发表你的看法，会公开广播。可空（沉默）也行。\n\n\
-         返回 JSON: {{\"speech\": \"<发言>\", \"thinking\": \"<给未来自己看的完整推理>\"}}",
-        view.me_role.label(),
-        team,
-        persona_line(view.persona),
-        RULES,
-    );
-    let user = view.render();
-    match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
-            Ok(r) => {
-                let thinking = norm_thinking(r.thinking.clone());
-                let speech = r
-                    .speech
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_default();
-                (speech, thinking)
-            }
-            Err(_) => (String::new(), None),
-        },
-        Err(e) => {
-            warn!(?e, "sheriff_side_speech LLM call failed");
-            (String::new(), None)
         }
     }
 }

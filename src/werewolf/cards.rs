@@ -1148,7 +1148,6 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
             }
             E::SheriffCandidates { .. }
             | E::SheriffSpeech { .. }
-            | E::SheriffSideSpeech { .. }
             | E::SheriffElected { .. }
             | E::SheriffDirection { .. } => Section::Sheriff,
             E::DaySpeech { day, .. } => Section::DaySpeech(*day),
@@ -1232,9 +1231,6 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
                 }
                 E::SheriffSpeech { player, text } => {
                     format!("  🎤 **{}** (上警发言)：{}", name(*player), text)
-                }
-                E::SheriffSideSpeech { player, text } => {
-                    format!("  💭 **{}** (警下)：{}", name(*player), text)
                 }
                 E::SheriffElected { player } => match player {
                     Some(p) => format!("  🎖️ **{}** 当选警长", name(*p)),

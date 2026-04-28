@@ -126,8 +126,6 @@ pub enum Stage {
     SheriffNominate,
     /// 白天 1——警长候选人轮流竞选发言。
     SheriffSpeech,
-    /// 白天 1——警下发言：非候选人轮流表态。
-    SheriffSideSpeech,
     /// 白天 1——上警投票：非候选人投出警长。
     SheriffVote,
     /// 警长产生后选择白天发言方向（警上 / 警下）。
@@ -157,7 +155,6 @@ impl Stage {
             Stage::DayReveal => "白天·公布死讯",
             Stage::SheriffNominate => "白天·上警阶段",
             Stage::SheriffSpeech => "白天·上警发言",
-            Stage::SheriffSideSpeech => "白天·警下发言",
             Stage::SheriffVote => "白天·警长投票",
             Stage::SheriffPickDirection => "白天·警长选择方向",
             Stage::DaySpeech => "白天·轮流发言",
@@ -340,18 +337,6 @@ pub struct WolfGame {
     #[serde(default)]
     pub sheriff_speech_private_msg: Option<String>,
 
-    // ---- 警下发言（非候选人轮流） ----
-    #[serde(default)]
-    pub sheriff_side_order: Vec<usize>,
-    #[serde(default)]
-    pub sheriff_side_idx: usize,
-    #[serde(default)]
-    pub sheriff_side_speeches: Vec<(usize, String)>,
-    #[serde(default)]
-    pub sheriff_side_public_msg: Option<String>,
-    #[serde(default)]
-    pub sheriff_side_private_msg: Option<String>,
-
     // ---- 死亡遗言 ----
     /// 待说遗言的玩家队列（按死亡顺序）。被毒 / 被开枪者不在内。
     #[serde(default)]
@@ -424,7 +409,6 @@ pub enum ThinkingKind {
     WitchAct,
     SheriffRun,
     SheriffSpeech,
-    SheriffSideSpeech,
     SheriffVote,
     SheriffDirection,
     DaySpeech,
@@ -444,7 +428,6 @@ impl ThinkingKind {
             ThinkingKind::WitchAct => "女巫行动",
             ThinkingKind::SheriffRun => "上警决定",
             ThinkingKind::SheriffSpeech => "上警发言",
-            ThinkingKind::SheriffSideSpeech => "警下发言",
             ThinkingKind::SheriffVote => "警长投票",
             ThinkingKind::SheriffDirection => "警上警下选向",
             ThinkingKind::DaySpeech => "白天发言",
@@ -477,8 +460,6 @@ pub enum RecapEvent {
     SheriffCandidates { candidates: Vec<usize> },
     /// 上警发言（候选人）
     SheriffSpeech { player: usize, text: String },
-    /// 警下发言（非候选人）
-    SheriffSideSpeech { player: usize, text: String },
     /// 警长当选（None = 流局）
     SheriffElected { player: Option<usize> },
     /// 警长选起手方向（true = 警上 / 顺时针）
@@ -535,11 +516,6 @@ impl WolfGame {
             sheriff_speeches: vec![],
             sheriff_speech_public_msg: None,
             sheriff_speech_private_msg: None,
-            sheriff_side_order: vec![],
-            sheriff_side_idx: 0,
-            sheriff_side_speeches: vec![],
-            sheriff_side_public_msg: None,
-            sheriff_side_private_msg: None,
             last_words_queue: vec![],
             last_words_idx: 0,
             last_words_speeches: vec![],
@@ -728,11 +704,6 @@ impl WolfGame {
         self.sheriff_speeches.clear();
         self.sheriff_speech_public_msg = None;
         self.sheriff_speech_private_msg = None;
-        self.sheriff_side_order.clear();
-        self.sheriff_side_idx = 0;
-        self.sheriff_side_speeches.clear();
-        self.sheriff_side_public_msg = None;
-        self.sheriff_side_private_msg = None;
         self.last_words_queue.clear();
         self.last_words_idx = 0;
         self.last_words_speeches.clear();
@@ -1417,90 +1388,13 @@ impl WolfGame {
         self.sheriff_speech_idx >= self.sheriff_speech_order.len()
     }
 
-    /// 上警发言全部说完 → 警下发言（如有非候选人）→ 警长投票。
+    /// 上警发言全部说完 → 直接进入警长投票。
     pub fn finish_sheriff_speeches(&mut self) -> Result<()> {
         if self.stage != Stage::SheriffSpeech {
             return Err(anyhow!("当前不是上警发言阶段"));
         }
         if !self.all_sheriff_speeches_done() {
             return Err(anyhow!("还有候选人没发言"));
-        }
-        let candidates = self.sheriff_candidates();
-        let side: Vec<usize> = self
-            .alive_indices()
-            .into_iter()
-            .filter(|i| !candidates.contains(i))
-            .collect();
-        if side.is_empty() {
-            // 全员都是候选人 → 跳过警下发言，直接投票
-            self.stage = Stage::SheriffVote;
-            self.sheriff_votes.clear();
-        } else {
-            self.sheriff_side_order = side;
-            self.sheriff_side_idx = 0;
-            self.sheriff_side_speeches.clear();
-            self.sheriff_side_public_msg = None;
-            self.sheriff_side_private_msg = None;
-            self.stage = Stage::SheriffSideSpeech;
-        }
-        Ok(())
-    }
-
-    pub fn current_sheriff_side_speaker(&self) -> Option<usize> {
-        self.sheriff_side_order
-            .get(self.sheriff_side_idx)
-            .copied()
-    }
-
-    pub fn submit_sheriff_side_speech(
-        &mut self,
-        speaker_open_id: &str,
-        text: String,
-    ) -> Result<()> {
-        if self.stage != Stage::SheriffSideSpeech {
-            return Err(anyhow!("当前不是警下发言阶段"));
-        }
-        let idx = self
-            .find_player(speaker_open_id)
-            .ok_or_else(|| anyhow!("你不在桌上"))?;
-        let expected = self
-            .current_sheriff_side_speaker()
-            .ok_or_else(|| anyhow!("发言已结束"))?;
-        if idx != expected {
-            return Err(anyhow!("还没轮到你发言"));
-        }
-        let trimmed = text.trim();
-        let display = if trimmed.is_empty() {
-            "(沉默)".to_string()
-        } else {
-            trimmed.to_string()
-        };
-        self.event_log.push(format!(
-            "警下发言 · {}：{}",
-            self.players[idx].name, display
-        ));
-        self.recap_log.push(RecapEvent::SheriffSideSpeech {
-            player: idx,
-            text: display.clone(),
-        });
-        self.sheriff_side_speeches.push((idx, display));
-        self.sheriff_side_idx += 1;
-        self.sheriff_side_private_msg = None;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn all_sheriff_side_speeches_done(&self) -> bool {
-        self.sheriff_side_idx >= self.sheriff_side_order.len()
-    }
-
-    /// 警下发言完毕 → 警长投票。
-    pub fn finish_sheriff_side_speeches(&mut self) -> Result<()> {
-        if self.stage != Stage::SheriffSideSpeech {
-            return Err(anyhow!("当前不是警下发言阶段"));
-        }
-        if self.sheriff_side_idx < self.sheriff_side_order.len() {
-            return Err(anyhow!("还有人没发言"));
         }
         self.stage = Stage::SheriffVote;
         self.sheriff_votes.clear();
@@ -2345,15 +2239,7 @@ mod tests {
         assert!(g.all_sheriff_speeches_done());
 
         g.finish_sheriff_speeches().unwrap();
-        // 候选人发完 → 警下发言（非候选人）
-        assert_eq!(g.stage, Stage::SheriffSideSpeech);
-        // 8 个非候选人都得发完
-        while !g.all_sheriff_side_speeches_done() {
-            let cur = g.current_sheriff_side_speaker().unwrap();
-            let oid = g.players[cur].open_id.clone();
-            g.submit_sheriff_side_speech(&oid, "".into()).unwrap();
-        }
-        g.finish_sheriff_side_speeches().unwrap();
+        // 候选人发完 → 直接进警长投票（没有警下发言环节）
         assert_eq!(g.stage, Stage::SheriffVote);
     }
 
