@@ -270,6 +270,11 @@ pub struct WolfGame {
     /// 每只狼当晚的行动卡 message_id，给 update_card 复用。
     #[serde(default)]
     pub wolf_night_msgs: Vec<(usize, String)>,
+    /// 白天投票每位玩家收到的私密投票卡 message_id，给 update_card 复用——
+    /// 不存的话每次 advance_wolf 进 DayVote 都会重发一张，造成投票卡刷屏。
+    /// (open_id, msg_id)。每轮 day vote 开始时清空。
+    #[serde(default)]
+    pub day_vote_msgs: Vec<(String, String)>,
     pub seer_check_target: Option<usize>,
     pub witch_save_choice: Option<bool>,
     pub witch_poison_target: Option<usize>,
@@ -489,6 +494,7 @@ impl WolfGame {
             wolf_chat: vec![],
             wolf_ready: vec![],
             wolf_night_msgs: vec![],
+            day_vote_msgs: vec![],
             seer_check_target: None,
             witch_save_choice: None,
             witch_poison_target: None,
@@ -1642,7 +1648,24 @@ impl WolfGame {
         }
         self.stage = Stage::DayVote;
         self.day_votes.clear();
+        self.day_vote_msgs.clear();
         Ok(())
+    }
+
+    /// 记录某玩家的当天投票卡 message_id，给 update_card 复用。
+    pub fn set_day_vote_msg(&mut self, open_id: &str, msg_id: String) {
+        if let Some(slot) = self.day_vote_msgs.iter_mut().find(|(o, _)| o == open_id) {
+            slot.1 = msg_id;
+        } else {
+            self.day_vote_msgs.push((open_id.to_string(), msg_id));
+        }
+    }
+
+    pub fn day_vote_msg(&self, open_id: &str) -> Option<&str> {
+        self.day_vote_msgs
+            .iter()
+            .find(|(o, _)| o == open_id)
+            .map(|(_, id)| id.as_str())
     }
 
     /// 一名玩家投票。target_open_id = None 表示弃权。
@@ -1883,6 +1906,7 @@ impl WolfGame {
         self.wolf_chat.clear();
         self.wolf_ready.clear();
         self.wolf_night_msgs.clear();
+        self.day_vote_msgs.clear();
         self.seer_check_target = None;
         self.witch_save_choice = None;
         self.witch_poison_target = None;

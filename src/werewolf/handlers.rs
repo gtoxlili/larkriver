@@ -1822,8 +1822,11 @@ impl Bot {
                         games.get(chat_id).map(|g| g.all_alive_voted()).unwrap_or(false)
                     };
                     if !all_voted {
-                        // 给还没投的人类发投票卡
-                        let humans_pending: Vec<String> = {
+                        // 给还没投的真人发投票卡。已经发过的（day_vote_msgs 里
+                        // 有 msg_id）走 update_card 复用原卡，没发过的才 send。
+                        // 不这样做的话每次有人投完触发 advance_wolf 都会给剩下
+                        // 的人重发一张，3 真人桌剩最后那个会收 N 张卡刷屏。
+                        let humans_pending: Vec<(String, Option<String>)> = {
                             let games = self.wolf_games.lock();
                             let Some(g) = games.get(chat_id) else { return };
                             g.alive_indices()
@@ -1832,21 +1835,35 @@ impl Bot {
                                     !g.players[*i].is_ai
                                         && g.day_votes.for_voter(*i).is_none()
                                 })
-                                .map(|i| g.players[i].open_id.clone())
+                                .map(|i| {
+                                    let oid = g.players[i].open_id.clone();
+                                    let existing = g.day_vote_msg(&oid).map(String::from);
+                                    (oid, existing)
+                                })
                                 .collect()
                         };
-                        for oid in humans_pending {
-                            let game = {
+                        for (oid, existing) in humans_pending {
+                            let card = {
                                 let games = self.wolf_games.lock();
-                                games.get(chat_id).cloned()
+                                let Some(g) = games.get(chat_id) else { return };
+                                let Some(p_idx) = g.find_player(&oid) else { continue };
+                                build_vote_card(g, &g.players[p_idx])
                             };
-                            if let Some(g) = game {
-                                if let Some(p_idx) = g.find_player(&oid) {
-                                    let c = build_vote_card(&g, &g.players[p_idx]);
-                                    let _ = self
-                                        .client
-                                        .send_ephemeral_card(chat_id, &oid, &c)
-                                        .await;
+                            // 已有卡 → 尝试 update；失败回落到重发
+                            if let Some(msg_id) = &existing {
+                                if self.client.update_card(msg_id, &card).await.is_ok() {
+                                    continue;
+                                }
+                            }
+                            if let Ok(new_id) = self
+                                .client
+                                .send_ephemeral_card(chat_id, &oid, &card)
+                                .await
+                            {
+                                let mut games = self.wolf_games.lock();
+                                if let Some(g) = games.get_mut(chat_id) {
+                                    g.set_day_vote_msg(&oid, new_id);
+                                    self.persist_wolf_locked(chat_id, g);
                                 }
                             }
                         }
