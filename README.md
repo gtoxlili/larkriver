@@ -38,6 +38,7 @@ docker run -d \
 | `im:message:send_as_bot` | 发消息 |
 | `im:message.group_at_msg:readonly` | 接收群里 @ 机器人 |
 | `im:chat:readonly` | 读群成员、用户进群事件 |
+| `contact:contact.base:readonly` | 读真人昵称（否则全部 fallback 成"玩家"，AI 没法分辨谁是谁）|
 
 **事件配置**（事件与回调 → 事件配置）
 
