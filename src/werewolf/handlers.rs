@@ -2136,6 +2136,24 @@ impl Bot {
     // AI 决策包装（外部调用 LLM）
     // ========================================================================
 
+    /// 把 LLM 返回的 thinking 落地到 game.thinking_log，下次同一玩家做决策时
+    /// 能在 prompt 里看到自己上几轮的内心独白，保持策略弧线的连贯性。
+    /// 严格私密：只属于该 player，绝不会被其他 AI 在 build_view 里看到。
+    fn save_thinking(
+        &self,
+        chat_id: &str,
+        player: usize,
+        kind: ThinkingKind,
+        thinking: Option<String>,
+    ) {
+        let Some(t) = thinking else { return };
+        let mut games = self.wolf_games.lock();
+        if let Some(g) = games.get_mut(chat_id) {
+            g.push_thinking(player, kind, t);
+            self.persist_wolf_locked(chat_id, g);
+        }
+    }
+
     /// AI 狼决策：返回目标 idx + 可选的狼频道发言。
     async fn wolf_ai_pick(
         &self,
@@ -2153,7 +2171,12 @@ impl Bot {
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::wolf_pick(llm, &view, &game, speak_enabled, history).await,
+            Some(llm) => {
+                let (decision, thinking) =
+                    wolf_llm::wolf_pick(llm, &view, &game, speak_enabled, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::WolfPick, thinking);
+                decision
+            }
             None => {
                 // fallback: 选第一个非狼存活
                 let target_idx = game
@@ -2234,7 +2257,11 @@ impl Bot {
         let Some(game) = game else { return 0 };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::seer_pick(llm, &view, history).await,
+            Some(llm) => {
+                let (target, thinking) = wolf_llm::seer_pick(llm, &view, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SeerCheck, thinking);
+                target
+            }
             None => game
                 .players
                 .iter()
@@ -2260,7 +2287,12 @@ impl Bot {
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::witch_decide(llm, &view, &game, history).await,
+            Some(llm) => {
+                let (decision, thinking) =
+                    wolf_llm::witch_decide(llm, &view, &game, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::WitchAct, thinking);
+                decision
+            }
             None => wolf_llm::WitchDecision::Skip,
         }
     }
@@ -2280,7 +2312,11 @@ impl Bot {
         };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::vote_pick(llm, &view, history).await,
+            Some(llm) => {
+                let (decision, thinking) = wolf_llm::vote_pick(llm, &view, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::DayVote, thinking);
+                decision
+            }
             None => wolf_llm::VoteDecision { target_idx: None },
         }
     }
@@ -2298,7 +2334,11 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::hunter_pick(llm, &view, history).await,
+            Some(llm) => {
+                let (target, thinking) = wolf_llm::hunter_pick(llm, &view, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::HunterShoot, thinking);
+                target
+            }
             None => None,
         }
     }
@@ -2311,7 +2351,11 @@ impl Bot {
         let Some(game) = game else { return String::new() };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_speech(llm, &view).await,
+            Some(llm) => {
+                let (speech, thinking) = wolf_llm::sheriff_speech(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffSpeech, thinking);
+                speech
+            }
             None => "我支持公平选举。".into(),
         }
     }
@@ -2324,7 +2368,11 @@ impl Bot {
         let Some(game) = game else { return String::new() };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::day_speech(llm, &view).await,
+            Some(llm) => {
+                let (speech, thinking) = wolf_llm::day_speech(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::DaySpeech, thinking);
+                speech
+            }
             None => String::new(),
         }
     }
@@ -2337,7 +2385,11 @@ impl Bot {
         let Some(game) = game else { return String::new() };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_side_speech(llm, &view).await,
+            Some(llm) => {
+                let (speech, thinking) = wolf_llm::sheriff_side_speech(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffSideSpeech, thinking);
+                speech
+            }
             None => String::new(),
         }
     }
@@ -2350,7 +2402,11 @@ impl Bot {
         let Some(game) = game else { return true };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_direction(llm, &view).await,
+            Some(llm) => {
+                let (clockwise, thinking) = wolf_llm::sheriff_direction(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffDirection, thinking);
+                clockwise
+            }
             None => true, // 默认警上
         }
     }
@@ -2387,11 +2443,18 @@ impl Bot {
                     return wolf_llm::DyingShooterDecision { speech: String::new(), target: None };
                 }
             };
-            let decision = wolf_llm::dying_hunter_combined(llm, &view, &hist).await;
+            let (decision, thinking) =
+                wolf_llm::dying_hunter_combined(llm, &view, &hist).await;
             // 验证目标合法性
             match decision.target {
-                None => return decision, // 不开枪 — 永远合法
-                Some(idx) if valid_targets.contains(&idx) => return decision,
+                None => {
+                    self.save_thinking(chat_id, ai_idx, ThinkingKind::DyingShoot, thinking);
+                    return decision;
+                }
+                Some(idx) if valid_targets.contains(&idx) => {
+                    self.save_thinking(chat_id, ai_idx, ThinkingKind::DyingShoot, thinking);
+                    return decision;
+                }
                 Some(idx) => {
                     hist.push((
                         format!(
@@ -2416,7 +2479,11 @@ impl Bot {
         let Some(game) = game else { return String::new() };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::last_words(llm, &view).await,
+            Some(llm) => {
+                let (speech, thinking) = wolf_llm::last_words(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::LastWords, thinking);
+                speech
+            }
             None => String::new(),
         }
     }
@@ -2670,7 +2737,12 @@ impl Bot {
         let Some(game) = game else { return ai_idx };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::guard_pick(llm, &view, &game, history).await,
+            Some(llm) => {
+                let (target, thinking) =
+                    wolf_llm::guard_pick(llm, &view, &game, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::GuardPick, thinking);
+                target
+            }
             None => {
                 // fallback：守自己（如果上夜没守过自己）；否则任意非昨守目标
                 if game.last_guard_target != Some(ai_idx) {
@@ -2693,7 +2765,11 @@ impl Bot {
         let Some(game) = game else { return false };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_run(llm, &view).await,
+            Some(llm) => {
+                let (run, thinking) = wolf_llm::sheriff_run(llm, &view).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffRun, thinking);
+                run
+            }
             // fallback: 预言家上警，其他人不上
             None => game.players[ai_idx].role == Some(crate::werewolf::game::Role::Seer),
         }
@@ -2722,7 +2798,12 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::sheriff_vote(llm, &view, &candidates, history).await,
+            Some(llm) => {
+                let (target, thinking) =
+                    wolf_llm::sheriff_vote(llm, &view, &candidates, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::SheriffVote, thinking);
+                target
+            }
             None => candidates.first().map(|(i, _)| *i),
         }
     }
@@ -2740,7 +2821,11 @@ impl Bot {
         let Some(game) = game else { return None };
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
-            Some(llm) => wolf_llm::badge_pass(llm, &view, history).await,
+            Some(llm) => {
+                let (target, thinking) = wolf_llm::badge_pass(llm, &view, history).await;
+                self.save_thinking(chat_id, ai_idx, ThinkingKind::BadgePass, thinking);
+                target
+            }
             None => None,
         }
     }

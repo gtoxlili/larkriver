@@ -397,6 +397,64 @@ pub struct WolfGame {
     /// 与 event_log（自然语言文本，给 AI prompt 用）平行存在。
     #[serde(default)]
     pub recap_log: Vec<RecapEvent>,
+
+    /// AI 玩家的私密"心路历程"——每次 LLM 调用返回的 `thinking` 字段都落地到这里。
+    /// 下一次同一玩家做决策时，把他自己的过往 thinking 拼回 prompt 上下文，
+    /// 这样他的策略弧线能跨轮延续（而不是每次调用都从头想）。**严格私密**：
+    /// 只有该玩家自己能在 build_view 里看到自己的条目，绝不暴露给其他 AI。
+    #[serde(default)]
+    pub thinking_log: Vec<ThinkingEntry>,
+}
+
+/// AI 私密 thinking 条目。每次调用 LLM 后由 handlers 写入。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingEntry {
+    pub player: usize,
+    pub day: u32,
+    pub kind: ThinkingKind,
+    pub thinking: String,
+}
+
+/// 标记一条 thinking 是哪个决策点产生的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkingKind {
+    GuardPick,
+    WolfPick,
+    SeerCheck,
+    WitchAct,
+    SheriffRun,
+    SheriffSpeech,
+    SheriffSideSpeech,
+    SheriffVote,
+    SheriffDirection,
+    DaySpeech,
+    DayVote,
+    LastWords,
+    DyingShoot,
+    BadgePass,
+    HunterShoot,
+}
+
+impl ThinkingKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingKind::GuardPick => "守卫守护",
+            ThinkingKind::WolfPick => "狼夜杀",
+            ThinkingKind::SeerCheck => "预言家查验",
+            ThinkingKind::WitchAct => "女巫行动",
+            ThinkingKind::SheriffRun => "上警决定",
+            ThinkingKind::SheriffSpeech => "上警发言",
+            ThinkingKind::SheriffSideSpeech => "警下发言",
+            ThinkingKind::SheriffVote => "警长投票",
+            ThinkingKind::SheriffDirection => "警上警下选向",
+            ThinkingKind::DaySpeech => "白天发言",
+            ThinkingKind::DayVote => "白天投票",
+            ThinkingKind::LastWords => "遗言",
+            ThinkingKind::DyingShoot => "临死开枪+遗言",
+            ThinkingKind::BadgePass => "警徽流转",
+            ThinkingKind::HunterShoot => "猎人开枪",
+        }
+    }
 }
 
 /// 复盘卡片要展示的所有结构化事件类型。游戏过程中按发生顺序追加到
@@ -496,7 +554,22 @@ impl WolfGame {
             event_log: vec![],
             deaths: vec![],
             recap_log: vec![],
+            thinking_log: vec![],
         }
+    }
+
+    /// 追加一条 AI 私密 thinking。空白文本忽略。
+    pub fn push_thinking(&mut self, player: usize, kind: ThinkingKind, thinking: String) {
+        let trimmed = thinking.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.thinking_log.push(ThinkingEntry {
+            player,
+            day: self.day,
+            kind,
+            thinking: trimmed.to_string(),
+        });
     }
 
     pub fn add_player(&mut self, open_id: String, name: String) -> Result<()> {
@@ -674,6 +747,7 @@ impl WolfGame {
         self.event_log.clear();
         self.deaths.clear();
         self.recap_log.clear();
+        self.thinking_log.clear();
 
         // 第一夜起点：有守卫先守卫，否则狼。
         self.stage = if self.role_idx(Role::Guard).is_some() {
@@ -772,9 +846,7 @@ impl WolfGame {
         if trimmed.is_empty() {
             return Err(anyhow!("消息为空"));
         }
-        // 防 spam，最多 200 字
-        let capped: String = trimmed.chars().take(200).collect();
-        self.wolf_chat.push((idx, capped));
+        self.wolf_chat.push((idx, trimmed.to_string()));
         Ok(())
     }
 
@@ -1214,11 +1286,10 @@ impl WolfGame {
             return Err(anyhow!("还没轮到你发言"));
         }
         let trimmed = text.trim();
-        let capped: String = trimmed.chars().take(200).collect();
-        let display = if capped.is_empty() {
+        let display = if trimmed.is_empty() {
             "(沉默)".to_string()
         } else {
-            capped
+            trimmed.to_string()
         };
         self.event_log.push(format!(
             "第 {} 天 · {} 发言：{}",
@@ -1335,11 +1406,10 @@ impl WolfGame {
             return Err(anyhow!("还没轮到你发言"));
         }
         let trimmed = text.trim();
-        let capped: String = trimmed.chars().take(200).collect();
-        let display = if capped.is_empty() {
+        let display = if trimmed.is_empty() {
             "(沉默)".to_string()
         } else {
-            capped
+            trimmed.to_string()
         };
         self.event_log.push(format!(
             "上警发言 · {}：{}",
@@ -1412,11 +1482,10 @@ impl WolfGame {
             return Err(anyhow!("还没轮到你发言"));
         }
         let trimmed = text.trim();
-        let capped: String = trimmed.chars().take(200).collect();
-        let display = if capped.is_empty() {
+        let display = if trimmed.is_empty() {
             "(沉默)".to_string()
         } else {
-            capped
+            trimmed.to_string()
         };
         self.event_log.push(format!(
             "警下发言 · {}：{}",
@@ -1470,11 +1539,10 @@ impl WolfGame {
             return Err(anyhow!("还没轮到你说遗言"));
         }
         let trimmed = text.trim();
-        let capped: String = trimmed.chars().take(300).collect();
-        let display = if capped.is_empty() {
+        let display = if trimmed.is_empty() {
             "(沉默)".to_string()
         } else {
-            capped
+            trimmed.to_string()
         };
         self.event_log.push(format!(
             "{} 的遗言：{}",

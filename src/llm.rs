@@ -214,8 +214,7 @@ impl LlmClient {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            // Sanity cap so the LLM doesn't paste an essay.
-            .map(|s| s.chars().take(60).collect::<String>());
+            .map(str::to_owned);
         let action = clamp_to_legal(raw, ctx);
         Ok(AiDecision { action, quip })
     }

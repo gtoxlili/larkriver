@@ -44,6 +44,10 @@ pub struct PublicView<'a> {
     /// 结构化复盘日志（公开 + 私有事件都在内）。render() 时只展示公开部分，
     /// 用来构造每位玩家的发言 + 投票档案，比 event_log 的扁平文本更易解析。
     pub recap_log: &'a [RecapEvent],
+    /// **本玩家自己**的过往 thinking 历史（从 thinking_log 中过滤）。
+    /// 让 AI 在每次决策前能看到自己上几轮的内心独白，保持策略弧线的连贯性。
+    /// **严格私密**——只含本玩家的条目，绝不包含其他玩家的 thinking。
+    pub my_thinking_history: Vec<&'a ThinkingEntry>,
 }
 
 impl<'a> PublicView<'a> {
@@ -110,6 +114,21 @@ impl<'a> PublicView<'a> {
                 out.push_str("  ");
                 out.push_str(s);
                 out.push('\n');
+            }
+        }
+
+        // === 你的内心独白历史（私密：你过去每次决策的 thinking，给本次决策做"自我连贯性"参考）===
+        // 这是你跨轮的策略弧线——你上把为什么这么投/这么说/这么编，本把要不要延续这个剧本。
+        // 高玩不会每把都从头想；上一把"我装女巫诈狼"的设定本把不能突然抛弃。
+        if !self.my_thinking_history.is_empty() {
+            out.push_str("\n## 🧠 你的内心独白历史（你过去几轮的 thinking，外人看不到）\n");
+            for entry in &self.my_thinking_history {
+                out.push_str(&format!(
+                    "\n### D{} · {}\n{}\n",
+                    entry.day,
+                    entry.kind.label(),
+                    entry.thinking
+                ));
             }
         }
 
@@ -384,6 +403,13 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         vec![]
     };
 
+    // 私密 thinking 历史：仅本玩家自己的条目，按发生顺序。绝不暴露给其他人。
+    let my_thinking_history: Vec<&ThinkingEntry> = game
+        .thinking_log
+        .iter()
+        .filter(|e| e.player == ai_idx)
+        .collect();
+
     PublicView {
         day: game.day,
         stage_label: game.stage.label(),
@@ -397,6 +423,7 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         event_log: &game.event_log,
         my_statements,
         recap_log: &game.recap_log,
+        my_thinking_history,
     }
 }
 
@@ -408,6 +435,11 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
 /// caller 在 retry 时把这个 history 传进来，函数内部把它转成多轮对话——
 /// LLM 能看见自己刚才的失败并据此调整选择，而不是被无脑重试。
 pub type AttemptHistory = Vec<(String, String)>;
+
+/// 把 LLM 返回的 `thinking` 字段标准化：去空白；空 → None。
+fn norm_thinking(t: Option<String>) -> Option<String> {
+    t.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
 
 /// 把 system / user / 历次失败 拼成多轮 messages，喂给 LLM。
 async fn chat_with_history(
@@ -436,23 +468,23 @@ async fn chat_with_history(
 // ============================================================================
 
 fn persona_line(persona: Option<Persona>) -> String {
-    let preamble = "## 高玩思考守则（每次决策都要遵循）\n\
-                    1. **优先看『玩家档案』** —— 每人发言+投票轨迹是真实信号，事件历史是嘈杂快照；先把每位玩家的脉络读完再下判断。\n\
-                    2. **多人跳同一神职 = 必有狼**（如两个预言家、两个女巫）。你必须**选边并给出理由**，不能和稀泥。\n\
-                    3. **拒绝跟票** —— 大多数人投谁不代表他真是狼。狼最爱用群体节奏掩护队友；如果场上正在向某个目标聚拢，先反问『这个目标真是狼吗，还是被狼带节奏？』\n\
-                    4. **保持流派烙印** —— 发言/投票/站警的风格要让人一眼读出你的流派；别打成模板化的『我觉得 X 有点像狼但也说不准』。\n\
-                    5. **逻辑要可反驳** —— 给出可验证的理由（基于具体玩家、具体发言、具体投票），让后面的人能接着推/驳；这样才打得起来一局好局。\n\
-                    6. **思考要深** —— 在 thinking 字段里写完整推理（你看到了什么、你信谁、你为什么这么投/这么说）；这是你高玩底牌的证明。\n\n";
+    let preamble = "## 决策时手头的资源\n\
+                    - **玩家档案**：每位玩家的公开发言 + 投票轨迹，按 idx 聚合\n\
+                    - **事件历史**：按时间的公开事件流（死讯 / 放逐 / 警徽流转 等）\n\
+                    - **内心独白历史**：你过去几轮 thinking 字段写过什么——这是你的策略弧线\n\
+                    - **你的公开发言**：你之前在场上说过的话，前后矛盾会被场上抓出\n\n\
+                    ## thinking 字段怎么写\n\
+                    - 这段 thinking 是**给未来的你**看的，下一次决策时会回到你的上下文里\n\
+                    - 你怎么打、按什么思路、押什么注，都写下来；越具体后面越好延续\n\
+                    - 战术、跳什么、报不报身份、跟不跟票、要不要弃权——都你自己定，没标准答案\n\n";
     match persona {
         Some(p) => format!(
-            "{}## 你的高玩档案：**{}**\n{}\n\n\
-             这是你的流派烙印——你的发言、投票、站警、跳身份的所有决策都要让其他玩家\
-             从行为里**读得出你是这个流派的高玩**。不是娱乐玩家，是有套路、能算几层的人。",
+            "{}## 你的流派烙印：**{}**\n{}",
             preamble,
             p.label(),
             p.werewolf_description()
         ),
-        None => format!("{}你没有特定流派，按一般直觉决策。", preamble),
+        None => format!("{}你没有特定流派，按自己直觉决策。", preamble),
     }
 }
 
@@ -480,7 +512,6 @@ struct WolfPickResp {
     #[serde(default)]
     chat: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -500,7 +531,7 @@ pub async fn wolf_pick(
     game: &WolfGame,
     speak_enabled: bool,
     history: &AttemptHistory,
-) -> WolfPickDecision {
+) -> (WolfPickDecision, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -510,7 +541,7 @@ pub async fn wolf_pick(
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
     if candidates.is_empty() {
-        return WolfPickDecision { target_idx: 0, chat: None };
+        return (WolfPickDecision { target_idx: 0, chat: None }, None);
     }
     let fallback = candidates[0].0;
 
@@ -587,20 +618,20 @@ pub async fn wolf_pick(
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|s| s.chars().take(60).collect::<String>())
+                        .map(str::to_owned)
                 } else {
                     None
                 };
-                WolfPickDecision { target_idx, chat }
+                (WolfPickDecision { target_idx, chat }, norm_thinking(r.thinking))
             }
             Err(e) => {
                 warn!(?e, content = %content, "wolf JSON parse failed");
-                WolfPickDecision { target_idx: fallback, chat: None }
+                (WolfPickDecision { target_idx: fallback, chat: None }, None)
             }
         },
         Err(e) => {
             warn!(?e, "wolf LLM call failed");
-            WolfPickDecision { target_idx: fallback, chat: None }
+            (WolfPickDecision { target_idx: fallback, chat: None }, None)
         }
     }
 }
@@ -613,7 +644,6 @@ pub async fn wolf_pick(
 struct SeerCheckResp {
     target_idx: usize,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -621,7 +651,7 @@ pub async fn seer_pick(
     llm: &LlmClient,
     view: &PublicView<'_>,
     history: &AttemptHistory,
-) -> usize {
+) -> (usize, Option<String>) {
     // 先收集已查过的玩家名（去重提示），让 prompt 引导 LLM 优先查没查过的。
     let already_checked: std::collections::HashSet<&str> = view
         .seer_log
@@ -635,7 +665,7 @@ pub async fn seer_pick(
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
     if candidates.is_empty() {
-        return 0;
+        return (0, None);
     }
     // fallback 优先选没查过的
     let fallback = candidates
@@ -665,21 +695,22 @@ pub async fn seer_pick(
     match chat_with_history(llm, system, user, history).await {
         Ok(content) => match serde_json::from_str::<SeerCheckResp>(&content) {
             Ok(r) => {
-                if candidates.iter().any(|(i, _)| *i == r.target_idx) {
+                let target = if candidates.iter().any(|(i, _)| *i == r.target_idx) {
                     r.target_idx
                 } else {
                     warn!(target = r.target_idx, "seer returned illegal idx, fallback");
                     fallback
-                }
+                };
+                (target, norm_thinking(r.thinking))
             }
             Err(e) => {
                 warn!(?e, content = %content, "seer JSON parse failed");
-                fallback
+                (fallback, None)
             }
         },
         Err(e) => {
             warn!(?e, "seer LLM call failed");
-            fallback
+            (fallback, None)
         }
     }
 }
@@ -695,7 +726,6 @@ struct WitchResp {
     #[serde(default)]
     poison_target_idx: Option<usize>,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -711,7 +741,7 @@ pub async fn witch_decide(
     view: &PublicView<'_>,
     game: &WolfGame,
     history: &AttemptHistory,
-) -> WitchDecision {
+) -> (WitchDecision, Option<String>) {
     // 候选毒目标：所有存活的非自己玩家
     let poison_candidates: Vec<(usize, String)> = view
         .players
@@ -753,18 +783,19 @@ pub async fn witch_decide(
         Ok(c) => c,
         Err(e) => {
             warn!(?e, "witch LLM call failed, skip");
-            return WitchDecision::Skip;
+            return (WitchDecision::Skip, None);
         }
     };
     let parsed: WitchResp = match serde_json::from_str(&raw) {
         Ok(r) => r,
         Err(e) => {
             warn!(?e, content = %raw, "witch JSON parse failed");
-            return WitchDecision::Skip;
+            return (WitchDecision::Skip, None);
         }
     };
+    let thinking = norm_thinking(parsed.thinking.clone());
 
-    match parsed.action.to_lowercase().as_str() {
+    let decision = match parsed.action.to_lowercase().as_str() {
         "save" => {
             if !game.witch_save_used && game.night_victim.is_some() {
                 WitchDecision::Save
@@ -774,19 +805,20 @@ pub async fn witch_decide(
         }
         "poison" => {
             if game.witch_poison_used {
-                return WitchDecision::Skip;
-            }
-            let Some(idx) = parsed.poison_target_idx else {
-                return WitchDecision::Skip;
-            };
-            if poison_candidates.iter().any(|(i, _)| *i == idx) {
-                WitchDecision::Poison(idx)
+                WitchDecision::Skip
+            } else if let Some(idx) = parsed.poison_target_idx {
+                if poison_candidates.iter().any(|(i, _)| *i == idx) {
+                    WitchDecision::Poison(idx)
+                } else {
+                    WitchDecision::Skip
+                }
             } else {
                 WitchDecision::Skip
             }
         }
         _ => WitchDecision::Skip,
-    }
+    };
+    (decision, thinking)
 }
 
 // ============================================================================
@@ -798,7 +830,6 @@ struct VoteResp {
     /// 玩家 idx 或 -1 弃权
     target_idx: i64,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -811,7 +842,7 @@ pub async fn vote_pick(
     llm: &LlmClient,
     view: &PublicView<'_>,
     history: &AttemptHistory,
-) -> VoteDecision {
+) -> (VoteDecision, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -826,26 +857,15 @@ pub async fn vote_pick(
     };
 
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，正在白天投票阶段。你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 投票任务\n\
+        "你是飞书群里玩狼人杀的玩家，正在白天投票阶段。你的真实身份是 **{}**。{}\n\
+         {}\n\n{}\n\n## 任务\n\
          投票放逐你认为应该被处决的玩家，或弃权 (target_idx = -1)。\
          不能投自己。**只投票，不发言**——发言阶段已经结束。\n\n\
-         ## 高玩投票守则\n\
-         1. **绝不无脑跟票** —— 看完『玩家档案』再下判断。狼最爱用群体节奏掩护队友。\
-            如果场上多数票指向某人，先反问：我从档案里**真的看到他像狼吗**？还是只是大家说他像？\n\
-         2. **预言家冲突要选边** —— 跳预言家的≥2 人时，必有一狼，不能弃权也不能乱投，要选你信的那个。\n\
-         3. **错投代价**：好人错投一票 = 把队友送出局，狼直接得分；狼错投 = 暴露身份。\n\
-         4. **你是 {}（{} 流派）** —— 投票决策也要符合你的流派判读模式：\
-            悍跳激进流投关键票时绝不犹豫；逻辑推理流投票要给出最严密的链条；\
-            节奏控场流通过投票配合自己之前的发言；静水深流保留信息一击致命；反水诡道流反向操作出乎意料。\n\
-         5. **弃权 = 浪费票权** —— 除非真的看不清，否则别弃权。\n\n\
-         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理：你扫过哪几个人、信谁、为什么投这个/弃权>\"}}",
+         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands_str: Vec<String> = candidates
         .iter()
@@ -861,14 +881,14 @@ pub async fn vote_pick(
         Ok(c) => c,
         Err(e) => {
             warn!(?e, "vote LLM call failed, abstain");
-            return VoteDecision { target_idx: None };
+            return (VoteDecision { target_idx: None }, None);
         }
     };
     let parsed: VoteResp = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "vote JSON parse failed");
-            return VoteDecision { target_idx: None };
+            return (VoteDecision { target_idx: None }, None);
         }
     };
     let target = if parsed.target_idx < 0 {
@@ -881,7 +901,7 @@ pub async fn vote_pick(
             None
         }
     };
-    VoteDecision { target_idx: target }
+    (VoteDecision { target_idx: target }, norm_thinking(parsed.thinking))
 }
 
 // ============================================================================
@@ -893,7 +913,6 @@ struct HunterResp {
     /// 目标 idx 或 -1 不开枪
     target_idx: i64,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -901,7 +920,7 @@ pub async fn hunter_pick(
     llm: &LlmClient,
     view: &PublicView<'_>,
     history: &AttemptHistory,
-) -> Option<usize> {
+) -> (Option<usize>, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -909,7 +928,7 @@ pub async fn hunter_pick(
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
     if candidates.is_empty() {
-        return None;
+        return (None, None);
     }
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
@@ -941,25 +960,28 @@ pub async fn hunter_pick(
         Ok(c) => c,
         Err(e) => {
             warn!(?e, "hunter LLM call failed");
-            return None;
+            return (None, None);
         }
     };
     let parsed: HunterResp = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "hunter JSON parse failed");
-            return None;
+            return (None, None);
         }
     };
-    if parsed.target_idx < 0 {
-        return None;
-    }
-    let idx = parsed.target_idx as usize;
-    if candidates.iter().any(|(i, _)| *i == idx) {
-        Some(idx)
-    } else {
+    let thinking = norm_thinking(parsed.thinking.clone());
+    let target = if parsed.target_idx < 0 {
         None
-    }
+    } else {
+        let idx = parsed.target_idx as usize;
+        if candidates.iter().any(|(i, _)| *i == idx) {
+            Some(idx)
+        } else {
+            None
+        }
+    };
+    (target, thinking)
 }
 
 // ============================================================================
@@ -970,7 +992,6 @@ pub async fn hunter_pick(
 struct GuardResp {
     target_idx: usize,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -979,7 +1000,7 @@ pub async fn guard_pick(
     view: &PublicView<'_>,
     game: &WolfGame,
     history: &AttemptHistory,
-) -> usize {
+) -> (usize, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -987,7 +1008,7 @@ pub async fn guard_pick(
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
     if candidates.is_empty() {
-        return view.me_idx;
+        return (view.me_idx, None);
     }
     let fallback = candidates
         .iter()
@@ -1020,12 +1041,15 @@ pub async fn guard_pick(
     );
     match chat_with_history(llm, system, user, history).await {
         Ok(c) => match serde_json::from_str::<GuardResp>(&c) {
-            Ok(r) if candidates.iter().any(|(i, _)| *i == r.target_idx) => r.target_idx,
-            _ => fallback,
+            Ok(r) if candidates.iter().any(|(i, _)| *i == r.target_idx) => {
+                (r.target_idx, norm_thinking(r.thinking))
+            }
+            Ok(r) => (fallback, norm_thinking(r.thinking)),
+            _ => (fallback, None),
         },
         Err(e) => {
             warn!(?e, "guard LLM call failed");
-            fallback
+            (fallback, None)
         }
     }
 }
@@ -1038,12 +1062,11 @@ pub async fn guard_pick(
 struct SheriffRunResp {
     run: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
 /// AI 决定是否上警。预言家通常会上（领跳），狼也可能上去抢警；村民/女巫/猎人/守卫看局势。
-pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> bool {
+pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> (bool, Option<String>) {
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
     } else {
@@ -1063,15 +1086,15 @@ pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> bool {
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<SheriffRunResp>(&c) {
-            Ok(r) => r.run,
+            Ok(r) => (r.run, norm_thinking(r.thinking)),
             Err(e) => {
                 warn!(?e, content = %c, "sheriff_run JSON parse failed");
-                view.me_role == Role::Seer
+                (view.me_role == Role::Seer, None)
             }
         },
         Err(e) => {
             warn!(?e, "sheriff_run LLM call failed");
-            view.me_role == Role::Seer
+            (view.me_role == Role::Seer, None)
         }
     }
 }
@@ -1080,7 +1103,6 @@ pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> bool {
 struct SheriffVoteResp {
     target_idx: i64,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -1090,9 +1112,9 @@ pub async fn sheriff_vote(
     view: &PublicView<'_>,
     candidates: &[(usize, String)],
     history: &AttemptHistory,
-) -> Option<usize> {
+) -> (Option<usize>, Option<String>) {
     if candidates.is_empty() {
-        return None;
+        return (None, None);
     }
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
@@ -1100,23 +1122,16 @@ pub async fn sheriff_vote(
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，正在警长投票阶段。\
+        "你是飞书群里玩狼人杀的玩家，正在警长投票阶段。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 警长投票任务\n\
-         - 在候选人中投出你支持的警长，或弃权 (target_idx = -1)。\n\
-         - 候选人不能投票（包含你自己若是候选人）。\n\n\
-         ## 高玩警长投票守则\n\
-         1. 这一票决定开局节奏：警长有 1.5x 票权 + 决定白天发言方向 + 警徽流转。\n\
-         2. 看『玩家档案』里候选人的上警发言：你信谁？跳预言家冲突时**必须选边**。\n\
-         3. 阵营立场：好人投真神职 / 真好人；狼投己方狼 / 投假预言家把警徽夺到狼方。\n\
-         4. **绝不无脑跟随大流** —— 别人投谁不代表他真该上。\n\
-         5. 流派烙印：你是 {} —— 决策方式要符合该流派。\n\n\
-         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理>\"}}",
+         {}\n\n{}\n\n## 任务\n\
+         在候选人中投出你支持的警长，或弃权 (target_idx = -1)。\
+         候选人不能投票（包含你自己若是候选人）。\n\n\
+         返回 JSON: {{\"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands: Vec<String> = candidates
         .iter()
@@ -1129,19 +1144,24 @@ pub async fn sheriff_vote(
     );
     match chat_with_history(llm, system, user, history).await {
         Ok(c) => match serde_json::from_str::<SheriffVoteResp>(&c) {
-            Ok(r) if r.target_idx >= 0 => {
-                let idx = r.target_idx as usize;
-                if candidates.iter().any(|(i, _)| *i == idx) {
-                    Some(idx)
+            Ok(r) => {
+                let target = if r.target_idx >= 0 {
+                    let idx = r.target_idx as usize;
+                    if candidates.iter().any(|(i, _)| *i == idx) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
+                };
+                (target, norm_thinking(r.thinking))
             }
-            _ => None,
+            _ => (None, None),
         },
         Err(e) => {
             warn!(?e, "sheriff_vote LLM call failed");
-            None
+            (None, None)
         }
     }
 }
@@ -1150,7 +1170,6 @@ pub async fn sheriff_vote(
 struct BadgeResp {
     target_idx: i64,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -1159,7 +1178,7 @@ pub async fn badge_pass(
     llm: &LlmClient,
     view: &PublicView<'_>,
     history: &AttemptHistory,
-) -> Option<usize> {
+) -> (Option<usize>, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -1167,7 +1186,7 @@ pub async fn badge_pass(
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
     if candidates.is_empty() {
-        return None;
+        return (None, None);
     }
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
@@ -1196,19 +1215,24 @@ pub async fn badge_pass(
     );
     match chat_with_history(llm, system, user, history).await {
         Ok(c) => match serde_json::from_str::<BadgeResp>(&c) {
-            Ok(r) if r.target_idx >= 0 => {
-                let idx = r.target_idx as usize;
-                if candidates.iter().any(|(i, _)| *i == idx) {
-                    Some(idx)
+            Ok(r) => {
+                let target = if r.target_idx >= 0 {
+                    let idx = r.target_idx as usize;
+                    if candidates.iter().any(|(i, _)| *i == idx) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
+                };
+                (target, norm_thinking(r.thinking))
             }
-            _ => None,
+            _ => (None, None),
         },
         Err(e) => {
             warn!(?e, "badge_pass LLM call failed");
-            None
+            (None, None)
         }
     }
 }
@@ -1221,116 +1245,104 @@ pub async fn badge_pass(
 struct SpeechResp {
     speech: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
 /// AI 上警竞选发言：候选人轮流发言，需要拉票 / 自报身份 / 攻击对手。
 /// 失败时返回简短默认词，避免阻塞。
-pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
+pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Option<String>) {
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
     } else {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，现在是第 1 天上警阶段，你正在做竞选发言。\
+        "你是飞书群里玩狼人杀的玩家，现在是第 1 天上警阶段，你正在做竞选发言。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 上警发言任务\n\
-         - 发表一段公开广播的竞选发言。\n\
-         - 风格：群聊语气、自然口语、≤ 80 字、一段话。\n\n\
-         ## 这是博弈的开局，你必须做的事\n\
-         1. 上警 = **押注立场**：要么报身份（预言家通常此时跳，狼也常悍跳），要么以村民身份立场强硬上去抢警徽（1.5x 票权）。\n\
-         2. 你的真实身份是 **{}**（{} 流派）—— 决定你这把『跳什么 / 怎么跳』：\n\
-            - 真预言家：上来报昨夜查验（必报），否则警徽被狼夺走全场被带歪。\n\
-            - 狼/狼王：考虑悍跳预言家（编造查验），把真预言家压回去；或装村民暗中投票配合狼队。\n\
-            - 女巫/猎人/守卫：神职上警通常不报身份（避免被狼夜杀），但要展现可信逻辑。\n\
-            - 普通村民：上警靠表态强硬，把警徽留在好人手里。\n\
-         3. 流派决定**风格**：悍跳激进流敢编敢喷；逻辑推理流不靠嗓门靠链条；节奏控场流梳理共识；静水深流话少分量重；反水诡道流敢反向开炮。\n\
-         4. **不要说空话** —— 每一句都要带可验证的内容（具体玩家、具体观察、具体押注）。\n\n\
-         返回 JSON: {{\"speech\": \"<发言, ≤80 字>\", \"thinking\": \"<你为何上警、跳什么身份、怎么打这一局>\"}}",
+         {}\n\n{}\n\n## 任务\n\
+         发表一段公开广播的竞选发言。跳什么身份、报不报查验、怎么拉票——都你自己定。\n\n\
+         返回 JSON: {{\"speech\": \"<发言>\", \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
-            Ok(r) => r
-                .speech
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(200).collect::<String>())
-                .unwrap_or_else(|| "我支持平和过渡，先听其他玩家。".into()),
+            Ok(r) => {
+                let thinking = norm_thinking(r.thinking.clone());
+                let speech = r
+                    .speech
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "我支持平和过渡，先听其他玩家。".into());
+                (speech, thinking)
+            }
             Err(e) => {
                 warn!(?e, content = %c, "sheriff_speech parse failed");
-                "我先表态。".into()
+                ("我先表态。".into(), None)
             }
         },
         Err(e) => {
             warn!(?e, "sheriff_speech LLM call failed");
-            "我先表态。".into()
+            ("我先表态。".into(), None)
         }
     }
 }
 
 /// AI 警下发言（非候选人对警上候选人发表观点）。
-pub async fn sheriff_side_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
+pub async fn sheriff_side_speech(
+    llm: &LlmClient,
+    view: &PublicView<'_>,
+) -> (String, Option<String>) {
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
     } else {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，正在警下发言阶段（非候选人对警上候选人表态）。\
+        "你是飞书群里玩狼人杀的玩家，正在警下发言阶段（非候选人对警上候选人表态）。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 警下发言任务\n\
-         - 对警上候选人发表你的看法，会公开广播。\n\
-         - 风格：群聊语气、≤ 60 字、一段话；可空 (沉默) 但代价高。\n\n\
-         ## 高玩警下发言要点\n\
-         1. 你不能上警，但你的发言会被警长候选人听到、被全场记住，**也会影响警长投票**。\n\
-         2. 看『玩家档案』里几位候选人的上警发言：哪个的逻辑更可信？\n\
-            如果有≥2 跳预言家，必有一狼，警下发言就是站边的关键时机。\n\
-         3. 你是 {}（{} 流派）—— 流派决定你怎么表态（悍跳激进 vs 静水深流的输出截然不同）。\n\
-         4. **拒绝套话** —— 『支持平和过渡』『听大家的』这种废话不如不说。\n\n\
-         返回 JSON: {{\"speech\": \"<发言, ≤60 字, 必须有可验证立场>\", \"thinking\": \"<你的判断依据>\"}}",
+         {}\n\n{}\n\n## 任务\n\
+         对警上候选人发表你的看法，会公开广播。可空（沉默）也行。\n\n\
+         返回 JSON: {{\"speech\": \"<发言>\", \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
-            Ok(r) => r
-                .speech
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(150).collect::<String>())
-                .unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(r) => {
+                let thinking = norm_thinking(r.thinking.clone());
+                let speech = r
+                    .speech
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                (speech, thinking)
+            }
+            Err(_) => (String::new(), None),
         },
         Err(e) => {
             warn!(?e, "sheriff_side_speech LLM call failed");
-            String::new()
+            (String::new(), None)
         }
     }
 }
 
 /// AI 警长选择 警上 / 警下 起手。返回 true = 警上（顺时针）。
-pub async fn sheriff_direction(llm: &LlmClient, view: &PublicView<'_>) -> bool {
+pub async fn sheriff_direction(llm: &LlmClient, view: &PublicView<'_>) -> (bool, Option<String>) {
     #[derive(Debug, Deserialize)]
     struct DirResp {
         clockwise: bool,
         #[serde(default)]
-        #[allow(dead_code)]
         thinking: Option<String>,
     }
     let team = if view.me_role.is_wolf() {
@@ -1354,59 +1366,53 @@ pub async fn sheriff_direction(llm: &LlmClient, view: &PublicView<'_>) -> bool {
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<DirResp>(&c) {
-            Ok(r) => r.clockwise,
-            Err(_) => true, // 默认警上
+            Ok(r) => (r.clockwise, norm_thinking(r.thinking)),
+            Err(_) => (true, None), // 默认警上
         },
         Err(e) => {
             warn!(?e, "sheriff_direction LLM call failed");
-            true
+            (true, None)
         }
     }
 }
 
 /// AI 死亡遗言。要求按角色 / 阵营立场最大化信息价值。
-pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> String {
+pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> (String, Option<String>) {
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
     } else {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，**你刚刚死亡，正在发表遗言**。\
+        "你是飞书群里玩狼人杀的玩家，**你刚刚死亡，正在发表遗言**。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 遗言任务\n\
-         - 发表你的遗言，会公开广播给所有玩家。\n\
-         - 风格：群聊语气、≤ 100 字；可空（沉默）但代价高。\n\n\
-         ## 高玩遗言要点\n\
-         1. 遗言是**最后一次留信号**给己方。死人也能左右场上推理。\n\
-         2. 真预言家被刀：遗言必须报全部查验 + 推荐警长接班 / 投谁。\n\
-         3. 真神职被刀：可选择是否报身份 + 给好人留一个推理方向。\n\
-         4. 好人被刀（村民）：用观察到的发言矛盾给出推理结论。\n\
-         5. 狼被刀（罕见）：遗言可继续误导（嫁祸 / 卖队友求信任）。\n\
-         6. 你是 {}（{} 流派）—— 遗言风格要保持流派烙印。\n\n\
-         返回 JSON: {{\"speech\": \"<遗言, ≤100 字, 信息密度要高>\", \"thinking\": \"<你想留下什么信号>\"}}",
+         {}\n\n{}\n\n## 任务\n\
+         发表你的遗言，会公开广播给所有玩家。说什么、报不报身份、留什么信号——都你自己定。可空（沉默）也行。\n\n\
+         返回 JSON: {{\"speech\": \"<遗言>\", \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
-            Ok(r) => r
-                .speech
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(250).collect::<String>())
-                .unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(r) => {
+                let thinking = norm_thinking(r.thinking.clone());
+                let speech = r
+                    .speech
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                (speech, thinking)
+            }
+            Err(_) => (String::new(), None),
         },
         Err(e) => {
             warn!(?e, "last_words LLM call failed");
-            String::new()
+            (String::new(), None)
         }
     }
 }
@@ -1422,7 +1428,6 @@ struct DyingShooterResp {
     #[serde(default)]
     target_idx: Option<i64>,
     #[serde(default)]
-    #[allow(dead_code)]
     thinking: Option<String>,
 }
 
@@ -1440,7 +1445,7 @@ pub async fn dying_hunter_combined(
     llm: &LlmClient,
     view: &PublicView<'_>,
     history: &AttemptHistory,
-) -> DyingShooterDecision {
+) -> (DyingShooterDecision, Option<String>) {
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
@@ -1455,28 +1460,20 @@ pub async fn dying_hunter_combined(
     };
 
     let system = format!(
-        "你是飞书群里的狼人杀高水平玩家，扮演 **{}**，刚刚死亡。{}\n\
+        "你是飞书群里的狼人杀玩家，扮演 **{}**，刚刚死亡。{}\n\
          {}\n\n{}\n\n## 任务（一次性两件事）\n\
-         1. **遗言**（公开广播给所有玩家）\n\
+         1. **遗言**：公开广播给所有玩家\n\
          2. **开枪**：可选一名存活的非自己玩家带走 (target_idx = idx)，\
             或选择不开枪 (target_idx = -1)\n\n\
-         **遗言和开枪决策必须一致**——你在遗言里说什么，开枪就要怎么做：\n\
-         - 如果你在遗言里报『我带走 N 号』，target_idx 必须是 N 号的 idx\n\
-         - 如果你在遗言里说『不开枪』或没提目标，target_idx 应该是 -1\n\
-         - 如果遗言里嫁祸 / 留给场上推理，开枪选择应当配合那个叙事\n\n\
+         **遗言和开枪决策必须一致**——遗言里说『我带走 N 号』就 target_idx = N；\
+         遗言里说不开枪 target_idx = -1；遗言里嫁祸 / 留推理也要配合开枪叙事。\n\n\
          注：公开广播只显示『X 临死前开枪带走 Y』或『X 选择不开枪』，**不会标记你的身份**\
          （猎人和狼王共享开枪技能，狼王惯例伪装成猎人）。\n\n\
-         ## 高玩开枪决策\n\
-         - 看『玩家档案』：你最确定是狼的人是谁？开枪带走他/她。\n\
-         - 如果你毫无把握，**带走最像狼的人比不开枪好**（不开枪 = 浪费技能）。\n\
-         - 你是 {}（{} 流派）—— 开枪选择也要符合流派烙印（悍跳激进流敢决断、逻辑推理流给出严密链条、反水诡道流可反手带走己方狼伪装好人，等等）。\n\n\
-         返回 JSON: {{\"speech\": \"<遗言, ≤100 字>\", \"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<完整推理：为何带走这个/不开枪>\"}}",
+         返回 JSON: {{\"speech\": \"<遗言>\", \"target_idx\": <整数 idx 或 -1>, \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let cands: Vec<String> = candidates
         .iter()
@@ -1492,28 +1489,35 @@ pub async fn dying_hunter_combined(
         Ok(c) => c,
         Err(e) => {
             warn!(?e, "dying_hunter_combined LLM call failed");
-            return DyingShooterDecision {
-                speech: String::new(),
-                target: None,
-            };
+            return (
+                DyingShooterDecision {
+                    speech: String::new(),
+                    target: None,
+                },
+                None,
+            );
         }
     };
     let parsed: DyingShooterResp = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "dying_hunter_combined JSON parse failed");
-            return DyingShooterDecision {
-                speech: String::new(),
-                target: None,
-            };
+            return (
+                DyingShooterDecision {
+                    speech: String::new(),
+                    target: None,
+                },
+                None,
+            );
         }
     };
+    let thinking = norm_thinking(parsed.thinking.clone());
     let speech = parsed
         .speech
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.chars().take(250).collect::<String>())
+        .map(str::to_owned)
         .unwrap_or_default();
     let target = match parsed.target_idx {
         Some(t) if t >= 0 => {
@@ -1526,59 +1530,49 @@ pub async fn dying_hunter_combined(
         }
         _ => None,
     };
-    DyingShooterDecision { speech, target }
+    (DyingShooterDecision { speech, target }, thinking)
 }
 
 /// AI 白天轮流发言。带上当天死讯 / 历史发言上下文，要求按角色立场说话。
-pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> String {
+pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Option<String>) {
     let team = if view.me_role.is_wolf() {
         "你的阵营是狼。"
     } else {
         "你的阵营是好人。"
     };
     let system = format!(
-        "你是飞书群里玩狼人杀的高水平玩家，现在是白天，轮到你发言（一次性单次发言，提交后回合结束）。\
+        "你是飞书群里玩狼人杀的玩家，现在是白天，轮到你发言（一次性单次发言，提交后回合结束）。\
          你的真实身份是 **{}**。{}\n\
-         {}\n\n{}\n\n## 你的发言任务\n\
-         - 发表一段公开广播给全场的看法。\n\
-         - 风格：群聊语气、自然口语、≤ 80 字、一段话；可空 (沉默) 但代价高。\n\n\
-         ## 这一刻你必须做的事（按顺序在 thinking 里走一遍）\n\
-         1. 把『玩家档案』里的每个存活玩家过一遍：他们都说过什么、投过谁？\n\
-         2. 是否存在跳神职冲突？谁的逻辑链更可信？\n\
-         3. 有没有人这一天还没发过言？没说话的玩家是更难分析（信息少），但也是潜在突破点。\n\
-         4. 我作为 **{}**（{} 流派），说出哪种话**最大化我方利益**？——\n\
-            - 如果你是预言家：你的查验信息是最强武器，是否报、何时报、报哪个？\n\
-            - 如果你是女巫/猎人/守卫：神职身份要不要暴露？藏起来更好还是亮出来逼狼？\n\
-            - 如果你是村民：你没确定信息，靠**指出别人逻辑的漏洞**找狼。\n\
-            - 如果你是狼/狼王：你的敌人是好人神职。装好人 / 带节奏 / 反咬狼队友 / 悍跳预言家——按你的流派选。\n\
-         5. 我说出的话能否被其他玩家**反驳或验证**？空话（『我感觉 X 像狼』）等于没说。\n\
-         6. **拒绝跟风**：如果场上正在向某人聚拢攻击，是不是被狼带节奏了？\n\n\
-         返回 JSON: {{\"speech\": \"<发言, ≤80 字, 必须有可验证逻辑>\", \"thinking\": \"<你完整的推理：扫了哪几个人、信谁、为什么这么说>\"}}",
+         {}\n\n{}\n\n## 任务\n\
+         发表一段公开广播给全场的看法。怎么说、说什么、要不要藏身份、跟不跟其他人——都你自己定。\n\n\
+         返回 JSON: {{\"speech\": \"<发言>\", \"thinking\": \"<给未来自己看的完整推理>\"}}",
         view.me_role.label(),
         team,
         persona_line(view.persona),
         RULES,
-        view.me_role.label(),
-        view.persona.map(|p| p.label()).unwrap_or("通用"),
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
         Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
-            Ok(r) => r
-                .speech
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(200).collect::<String>())
-                .unwrap_or_default(),
+            Ok(r) => {
+                let thinking = norm_thinking(r.thinking.clone());
+                let speech = r
+                    .speech
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                (speech, thinking)
+            }
             Err(e) => {
                 warn!(?e, content = %c, "day_speech parse failed");
-                String::new()
+                (String::new(), None)
             }
         },
         Err(e) => {
             warn!(?e, "day_speech LLM call failed");
-            String::new()
+            (String::new(), None)
         }
     }
 }
