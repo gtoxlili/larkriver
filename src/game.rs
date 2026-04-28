@@ -1,6 +1,6 @@
 use crate::poker::{best_five, category_name, Card, Deck, DeckMode, HandRank};
 use anyhow::{anyhow, Result};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 
 /// Personality archetype for an AI seat. Drives the LLM system prompt so the
@@ -109,7 +109,7 @@ impl Persona {
             Persona::TightWeak,
             Persona::Maniac,
         ];
-        *all.choose(&mut rand::thread_rng()).unwrap()
+        *all.choose(&mut rand::rng()).unwrap()
     }
 }
 

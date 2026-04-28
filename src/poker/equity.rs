@@ -9,7 +9,6 @@
 //! ~50–250 ms at 2000 iterations on a modern CPU. Run this off the lock.
 
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::collections::HashSet;
 
 use super::card::{Card, Rank, Suit};
@@ -52,7 +51,7 @@ pub fn equity(
         return 0.0;
     }
 
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let mut score = 0.0;
     // Reusable scratch buffers — keep allocations out of the hot loop.
     let mut full_community: Vec<Card> = Vec::with_capacity(5);

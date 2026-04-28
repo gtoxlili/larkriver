@@ -15,7 +15,7 @@
 
 use crate::game::Persona;
 use anyhow::{anyhow, Result};
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
 
 /// 7 种身份。
@@ -669,7 +669,7 @@ impl WolfGame {
             return Err(anyhow!("狼人杀需要 9-12 名玩家，当前 {}", n));
         }
         let mut roles = role_distribution(n)?;
-        roles.shuffle(&mut rand::thread_rng());
+        roles.shuffle(&mut rand::rng());
 
         for (p, role) in self.players.iter_mut().zip(roles.iter()) {
             p.role = Some(*role);
@@ -894,7 +894,7 @@ impl WolfGame {
             .map(|(t, _)| *t)
             .collect();
         let chosen = *candidates
-            .choose(&mut rand::thread_rng())
+            .choose(&mut rand::rng())
             .expect("non-empty candidates after non-empty votes");
         self.night_victim = Some(chosen);
     }
@@ -1165,9 +1165,8 @@ impl WolfGame {
             return;
         }
         // 无警长：随机起点
-        use rand::seq::SliceRandom;
         let alive: Vec<usize> = self.alive_indices();
-        let start = *alive.choose(&mut rand::thread_rng()).unwrap_or(&0);
+        let start = *alive.choose(&mut rand::rng()).unwrap_or(&0);
         let mut order: Vec<usize> = vec![];
         for k in 0..n {
             let idx = (start + k) % n;

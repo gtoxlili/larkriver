@@ -1,5 +1,5 @@
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::rng;
 use serde::{Deserialize, Serialize};
 
 use super::DeckMode;
@@ -68,7 +68,7 @@ impl Deck {
                 cards.push(Card { rank: Rank(r), suit: s });
             }
         }
-        cards.shuffle(&mut thread_rng());
+        cards.shuffle(&mut rng());
         Self { cards }
     }
 

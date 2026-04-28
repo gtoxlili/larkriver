@@ -10,7 +10,7 @@
 use crate::game::Game;
 use crate::werewolf::WolfGame;
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

@@ -7,10 +7,10 @@ use crate::poker::{Card, DeckMode};
 use anyhow::{anyhow, Context, Result};
 use async_openai::{
     config::OpenAIConfig,
-    types::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ReasoningEffort,
-        ResponseFormat,
+    types::chat::{
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs, ReasoningEffort, ResponseFormat,
     },
     Client,
 };
@@ -99,7 +99,7 @@ impl LlmClient {
         // (role, content) → 库内的 message 类型
         let to_lib_msg = |role: &str,
                           content: &str|
-         -> Result<async_openai::types::ChatCompletionRequestMessage> {
+         -> Result<ChatCompletionRequestMessage> {
             Ok(match role {
                 "system" => ChatCompletionRequestSystemMessageArgs::default()
                     .content(content)
@@ -133,14 +133,13 @@ impl LlmClient {
             }
             // temperature 0.6：之前 0.9 多样性好但逻辑松散，调低后 LLM
             // 推理更紧凑（实测 0.9 会让狼人杀 AI 套话术、跟风、自相矛盾）。
-            // reasoning_effort=High：尽量让模型多走几层思考链。async-openai
-            // 0.27 没有 Max 变体，这是当前枚举的最高档。
+            // reasoning_effort=Xhigh：当前枚举里最深档思考链。
             let req = CreateChatCompletionRequestArgs::default()
                 .model(&self.model)
                 .messages(request_msgs)
                 .response_format(ResponseFormat::JsonObject)
                 .temperature(0.6)
-                .reasoning_effort(ReasoningEffort::High)
+                .reasoning_effort(ReasoningEffort::Xhigh)
                 .build()?;
 
             let response = self.client.chat().create(req).await?;
