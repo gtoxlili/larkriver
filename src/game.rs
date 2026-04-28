@@ -1,6 +1,5 @@
 use crate::poker::{best_five, category_name, Card, Deck, DeckMode, HandRank};
 use anyhow::{anyhow, Result};
-use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 
 /// Personality archetype for an AI seat. Drives the LLM system prompt so the
@@ -102,14 +101,14 @@ impl Persona {
     }
 
     pub fn random() -> Self {
-        let all = [
+        const ALL: [Persona; 5] = [
             Persona::LooseAggressive,
             Persona::TightAggressive,
             Persona::LooseWeak,
             Persona::TightWeak,
             Persona::Maniac,
         ];
-        *all.choose(&mut rand::rng()).unwrap()
+        ALL[fastrand::usize(0..ALL.len())]
     }
 }
 

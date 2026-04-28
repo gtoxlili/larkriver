@@ -1,6 +1,5 @@
-use rand::seq::SliceRandom;
-use rand::rng;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use super::DeckMode;
 
@@ -19,6 +18,27 @@ impl Suit {
             Suit::Hearts => "♥",
             Suit::Diamonds => "♦",
             Suit::Clubs => "♣",
+        }
+    }
+
+    /// 0..=3 packed index — matches the encoding used by [`Card::packed`].
+    #[inline(always)]
+    pub fn index(self) -> u8 {
+        match self {
+            Suit::Spades => 0,
+            Suit::Hearts => 1,
+            Suit::Diamonds => 2,
+            Suit::Clubs => 3,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_index(i: u8) -> Self {
+        match i & 0b11 {
+            0 => Suit::Spades,
+            1 => Suit::Hearts,
+            2 => Suit::Diamonds,
+            _ => Suit::Clubs,
         }
     }
 }
@@ -49,8 +69,32 @@ impl Card {
     pub fn label(self) -> String {
         format!("{}{}", self.rank.label(), self.suit.symbol())
     }
+
+    /// Pack a card into a single 0..52 index: `rank_idx * 4 + suit_idx`,
+    /// where `rank_idx = rank - 2` (0..=12). Used for the `u64` bitset
+    /// representation that the hot eval / equity paths operate on.
+    #[inline(always)]
+    pub fn packed(self) -> u8 {
+        (self.rank.0 - 2) * 4 + self.suit.index()
+    }
+
+    /// Inverse of [`Card::packed`].
+    #[inline(always)]
+    pub fn from_packed(p: u8) -> Self {
+        debug_assert!(p < 52);
+        let suit = Suit::from_index(p & 0b11);
+        let rank = Rank(2 + (p >> 2));
+        Card { rank, suit }
+    }
 }
 
+/// In-memory deck used to draw hole / community cards during a hand.
+///
+/// Stores the cards as a stack (top = last) — `draw()` pops in O(1) and the
+/// shuffle uses [`fastrand`] (single-threaded thread-local PRNG, dramatically
+/// faster than `rand::rng()` for non-crypto needs).
+///
+/// Serialised as a `Vec<Card>` so existing redb dumps load unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deck {
     cards: Vec<Card>,
@@ -62,14 +106,21 @@ impl Deck {
             DeckMode::Standard => 2u8,
             DeckMode::ShortDeck => 6u8,
         };
-        let mut cards = Vec::with_capacity(52);
+        let cap = (15 - low as usize) * 4; // 52 or 36
+        let mut cards: SmallVec<Card, 52> = SmallVec::with_capacity(cap);
         for r in low..=14u8 {
             for s in [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs] {
                 cards.push(Card { rank: Rank(r), suit: s });
             }
         }
-        cards.shuffle(&mut rng());
-        Self { cards }
+        // Fisher–Yates with fastrand. Avoids the rand::seq machinery + thread_rng
+        // lookup. Inlined entirely.
+        let n = cards.len();
+        for i in (1..n).rev() {
+            let j = fastrand::usize(0..=i);
+            cards.swap(i, j);
+        }
+        Self { cards: cards.into_vec() }
     }
 
     pub fn draw(&mut self) -> Option<Card> {
@@ -77,6 +128,15 @@ impl Deck {
     }
 
     pub fn draw_n(&mut self, n: usize) -> Vec<Card> {
-        (0..n).filter_map(|_| self.draw()).collect()
+        // Match the original pop-order semantics so community-card display
+        // and any deck-order-sensitive logic stay byte-identical.
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.cards.pop() {
+                Some(c) => out.push(c),
+                None => break,
+            }
+        }
+        out
     }
 }

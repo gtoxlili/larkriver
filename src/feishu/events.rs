@@ -36,7 +36,9 @@ pub fn parse_inbound_message(payload: &Value) -> Option<InboundMessage> {
     let chat_type = m.get("chat_type")?.as_str().unwrap_or("group");
     let message_type = m.get("message_type")?.as_str().unwrap_or("text");
     let content_str = m.get("content")?.as_str()?;
-    let content_json: Value = serde_json::from_str(content_str).unwrap_or(Value::Null);
+    // SIMD JSON parse for the inner content blob — this runs on every
+    // inbound text message webhook.
+    let content_json: Value = sonic_rs::from_str(content_str).unwrap_or(Value::Null);
     let text = content_json
         .get("text")
         .and_then(|v| v.as_str())

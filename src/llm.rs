@@ -207,7 +207,7 @@ impl LlmClient {
                 ("user".into(), build_prompt(ctx)),
             ])
             .await?;
-        let raw: RawDecision = serde_json::from_str(&content)
+        let raw: RawDecision = sonic_rs::from_str(&content)
             .with_context(|| format!("LLM bad JSON: {content}"))?;
         let quip = raw
             .quip

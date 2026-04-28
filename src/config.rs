@@ -50,7 +50,12 @@ fn load_dotenv() -> Result<()> {
         if let Some((k, v)) = line.split_once('=') {
             let v = v.trim().trim_matches('"').trim_matches('\'');
             if std::env::var(k.trim()).is_err() {
-                std::env::set_var(k.trim(), v);
+                // SAFETY: Rust 2024 marks `set_var` as unsafe because it
+                // can race with concurrent `getenv` calls (libc envvars
+                // aren't synchronised). We're called once at process
+                // start before any tokio threads / reqwest workers spawn,
+                // so there are no concurrent readers — this is sound.
+                unsafe { std::env::set_var(k.trim(), v) };
             }
         }
     }

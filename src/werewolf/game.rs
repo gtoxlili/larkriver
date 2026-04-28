@@ -15,8 +15,18 @@
 
 use crate::game::Persona;
 use anyhow::{anyhow, Result};
-use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
+
+/// In-place Fisher–Yates shuffle backed by `fastrand`. Replaces the old
+/// `rand::seq::SliceRandom::shuffle` call site so we drop the `rand` dep
+/// entirely without disturbing the role-assignment semantics.
+#[inline]
+fn shuffle_in_place<T>(slice: &mut [T]) {
+    for i in (1..slice.len()).rev() {
+        let j = fastrand::usize(0..=i);
+        slice.swap(i, j);
+    }
+}
 
 /// 7 种身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,7 +679,7 @@ impl WolfGame {
             return Err(anyhow!("狼人杀需要 9-12 名玩家，当前 {}", n));
         }
         let mut roles = role_distribution(n)?;
-        roles.shuffle(&mut rand::rng());
+        shuffle_in_place(&mut roles);
 
         for (p, role) in self.players.iter_mut().zip(roles.iter()) {
             p.role = Some(*role);
@@ -893,9 +903,7 @@ impl WolfGame {
             .filter(|(_, c)| *c == max)
             .map(|(t, _)| *t)
             .collect();
-        let chosen = *candidates
-            .choose(&mut rand::rng())
-            .expect("non-empty candidates after non-empty votes");
+        let chosen = candidates[fastrand::usize(0..candidates.len())];
         self.night_victim = Some(chosen);
     }
 
@@ -1166,7 +1174,11 @@ impl WolfGame {
         }
         // 无警长：随机起点
         let alive: Vec<usize> = self.alive_indices();
-        let start = *alive.choose(&mut rand::rng()).unwrap_or(&0);
+        let start = if alive.is_empty() {
+            0
+        } else {
+            alive[fastrand::usize(0..alive.len())]
+        };
         let mut order: Vec<usize> = vec![];
         for k in 0..n {
             let idx = (start + k) % n;

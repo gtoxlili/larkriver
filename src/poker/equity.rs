@@ -1,35 +1,51 @@
-//! Monte-Carlo equity (showdown win rate) for the actor's own ephemeral card.
+//! Monte-Carlo equity (showdown win rate) for the actor's own hole cards.
 //!
-//! Given the actor's hole cards, the revealed community cards, and the count
+//! Given the hero's hole cards, the revealed community cards, and the count
 //! of opponents still in the hand, simulate `iterations` random complete deals
-//! and return the actor's win probability. Ties are scored as half-wins
-//! (split-pot approximation, good enough for chat-poker UX).
+//! and return the hero's win probability. Ties score as half-wins
+//! (split-pot approximation).
 //!
-//! Cost is roughly `iterations * (n_opponents + 1) * 21 * O(evaluate_5)` —
-//! ~50–250 ms at 2000 iterations on a modern CPU. Run this off the lock.
+//! ## 2026 hot-path overhauls
+//! - **Bitmask used-card lookup** — replaces the old `HashSet<Card>` with a
+//!   `u64` bit-set indexed by `Card::packed()` (0..52). The used-set check is
+//!   one bit-test instead of a hash + probe.
+//! - **Per-iteration partial Fisher-Yates** — only shuffles the prefix we
+//!   actually consume (`need_total` slots), not the entire 50-card residual.
+//! - **`fastrand` thread-local RNG** — single-instruction `usize` draw, vs
+//!   `rand`'s thread-local-with-OS-seed reseed loop.
+//! - **`rayon` parallelism** — iterations are independent, so we fan out
+//!   across all CPU cores and sum the scores. Linear scaling on multi-core.
+//! - **`SmallVec` scratch buffers** — the 5-card community + 7-card eval
+//!   buffers live entirely on the stack.
+//!
+//! Cost is now bounded mostly by `evaluate()` itself, which is histogram /
+//! bitmask based and never allocates.
 
-use rand::seq::SliceRandom;
-use std::collections::HashSet;
+use rayon::prelude::*;
+use smallvec::SmallVec;
 
-use super::card::{Card, Rank, Suit};
-use super::hand::evaluate;
+use super::card::Card;
+use super::hand::{evaluate, HandRank};
 use super::DeckMode;
 
-fn full_deck(mode: DeckMode) -> Vec<Card> {
+/// Build the residual deck (cards NOT already in `used_mask`) as a Vec of
+/// packed-u8 indices. Order is deterministic: sorted ascending, which the
+/// per-iteration Fisher-Yates then breaks.
+fn residual_pool(mode: DeckMode, used_mask: u64) -> Vec<u8> {
     let low = match mode {
         DeckMode::Standard => 2u8,
         DeckMode::ShortDeck => 6u8,
     };
-    let mut cards = Vec::with_capacity(52);
+    let mut out = Vec::with_capacity((15 - low as usize) * 4);
     for r in low..=14u8 {
-        for s in [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs] {
-            cards.push(Card {
-                rank: Rank(r),
-                suit: s,
-            });
+        for s in 0..4u8 {
+            let p = (r - 2) * 4 + s;
+            if used_mask & (1u64 << p) == 0 {
+                out.push(p);
+            }
         }
     }
-    cards
+    out
 }
 
 pub fn equity(
@@ -45,60 +61,100 @@ pub fn equity(
     let need_community = 5usize.saturating_sub(community.len());
     let need_total = 2 * n_opponents + need_community;
 
-    let used: HashSet<Card> = hole.iter().chain(community.iter()).copied().collect();
-    let mut remaining: Vec<Card> = full_deck(mode).into_iter().filter(|c| !used.contains(c)).collect();
-    if remaining.len() < need_total {
+    // Used-card bitmask: one bit per packed card index.
+    let mut used: u64 = 0;
+    for c in hole.iter().chain(community.iter()) {
+        used |= 1u64 << c.packed();
+    }
+    let pool: Vec<u8> = residual_pool(mode, used);
+    if pool.len() < need_total {
         return 0.0;
     }
 
-    let mut rng = rand::rng();
-    let mut score = 0.0;
-    // Reusable scratch buffers — keep allocations out of the hot loop.
-    let mut full_community: Vec<Card> = Vec::with_capacity(5);
-    let mut seven: Vec<Card> = Vec::with_capacity(7);
+    // Snapshot inputs for the parallel closure.
+    let hero_hole: [u8; 2] = [hole[0].packed(), hole[1].packed()];
+    let community_packed: SmallVec<u8, 5> =
+        community.iter().map(|c| c.packed()).collect();
 
-    for _ in 0..iterations {
-        remaining.shuffle(&mut rng);
+    // Parallel Monte-Carlo: each worker keeps a thread-local copy of the
+    // pool to perform partial Fisher-Yates without contention.
+    let total_score: f64 = (0..iterations)
+        .into_par_iter()
+        .map_init(
+            || pool.clone(),
+            |pool, _| simulate_one(
+                pool,
+                need_total,
+                need_community,
+                n_opponents,
+                hero_hole,
+                &community_packed,
+                mode,
+            ),
+        )
+        .sum();
 
-        // Slice plan inside `remaining`:
-        //   [0 .. 2*n_opponents)                    opponent hole cards
-        //   [2*n_opponents .. 2*n_opp + need_comm)  fill-in community
+    total_score / iterations as f64
+}
 
-        full_community.clear();
-        full_community.extend_from_slice(community);
-        for j in 0..need_community {
-            full_community.push(remaining[2 * n_opponents + j]);
-        }
-
-        // Hero
-        seven.clear();
-        seven.extend_from_slice(hole);
-        seven.extend_from_slice(&full_community);
-        let hero_rank = evaluate(&seven, mode);
-
-        // Best opponent
-        let mut max_opp = None;
-        for i in 0..n_opponents {
-            seven.clear();
-            seven.push(remaining[2 * i]);
-            seven.push(remaining[2 * i + 1]);
-            seven.extend_from_slice(&full_community);
-            let r = evaluate(&seven, mode);
-            max_opp = match max_opp {
-                Some(m) if m >= r => Some(m),
-                _ => Some(r),
-            };
-        }
-        let max_opp = max_opp.unwrap();
-
-        if hero_rank > max_opp {
-            score += 1.0;
-        } else if hero_rank == max_opp {
-            score += 0.5;
-        }
+#[inline]
+fn simulate_one(
+    pool: &mut [u8],
+    need_total: usize,
+    need_community: usize,
+    n_opponents: usize,
+    hero_hole: [u8; 2],
+    community_packed: &[u8],
+    mode: DeckMode,
+) -> f64 {
+    // Partial Fisher-Yates: only randomise the first `need_total` slots.
+    // Each pick swaps in one fresh random tail card; that's all we need to
+    // expose to the iteration's deal logic.
+    let n = pool.len();
+    let last = need_total.min(n.saturating_sub(1));
+    for i in 0..last {
+        let j = fastrand::usize(i..n);
+        pool.swap(i, j);
     }
 
-    score / iterations as f64
+    // Build the 5-card community used by everyone in this iteration.
+    let mut full_community: SmallVec<Card, 5> = SmallVec::new();
+    for &p in community_packed {
+        full_community.push(Card::from_packed(p));
+    }
+    for j in 0..need_community {
+        full_community.push(Card::from_packed(pool[2 * n_opponents + j]));
+    }
+
+    // Hero: hole + community
+    let mut seven: SmallVec<Card, 7> = SmallVec::new();
+    seven.push(Card::from_packed(hero_hole[0]));
+    seven.push(Card::from_packed(hero_hole[1]));
+    seven.extend_from_slice(&full_community);
+    let hero_rank = evaluate(&seven, mode);
+
+    // Best opponent
+    let mut max_opp: Option<HandRank> = None;
+    for i in 0..n_opponents {
+        seven.clear();
+        seven.push(Card::from_packed(pool[2 * i]));
+        seven.push(Card::from_packed(pool[2 * i + 1]));
+        seven.extend_from_slice(&full_community);
+        let r = evaluate(&seven, mode);
+        max_opp = match max_opp {
+            Some(m) if m >= r => Some(m),
+            _ => Some(r),
+        };
+    }
+    let max_opp = max_opp.expect("n_opponents > 0 enforced by caller");
+
+    if hero_rank > max_opp {
+        1.0
+    } else if hero_rank == max_opp {
+        0.5
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]

@@ -8,10 +8,10 @@ use crate::poker::{category_name, DeckMode};
 use crate::storage::Store;
 use crate::werewolf::WolfGame;
 
+use crate::util::FoldHashMap;
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -19,21 +19,21 @@ use tracing::{info, warn};
 pub struct Bot {
     pub client: Arc<FeishuClient>,
     pub(crate) cfg: Config,
-    pub(crate) games: Mutex<HashMap<String, Game>>, // chat_id → game
+    pub(crate) games: Mutex<FoldHashMap<String, Game>>, // chat_id → game
     /// Werewolf games keyed by chat_id, parallel to `games`. A chat can host
     /// both a poker table and a werewolf table simultaneously — they share
     /// nothing except the same dedup / LLM / store infrastructure.
-    pub(crate) wolf_games: Mutex<HashMap<String, WolfGame>>,
+    pub(crate) wolf_games: Mutex<FoldHashMap<String, WolfGame>>,
     pub(crate) bot_open_id: Mutex<Option<String>>,
     /// Dedup cache keyed by `header.event_id` — catches Feishu's same-id
     /// retries within a long window.
-    pub(crate) seen_events: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_events: Mutex<FoldHashMap<String, Instant>>,
     /// Fallback dedup keyed by a content fingerprint of card actions
     /// (`open_id` + `value` JSON). Catches the empirical case where Feishu
     /// re-delivers the *same logical click* under a different `event_id`.
     /// Short window (a few seconds) so legitimate re-clicks later are still
     /// processed.
-    pub(crate) seen_actions: Mutex<HashMap<String, Instant>>,
+    pub(crate) seen_actions: Mutex<FoldHashMap<u64, Instant>>,
     /// LLM client. `None` when `OPENAI_API_KEY` is unset → AI features hide.
     pub(crate) llm: Option<LlmClient>,
     /// Disk-backed game state. Loaded on startup, written after each mutation.
@@ -77,7 +77,7 @@ impl Bot {
             }
             Err(e) => {
                 warn!(?e, "failed to load poker games from disk; starting empty");
-                HashMap::new()
+                FoldHashMap::default()
             }
         };
         let wolf_games = match store.load_all_wolf() {
@@ -89,7 +89,7 @@ impl Bot {
             }
             Err(e) => {
                 warn!(?e, "failed to load werewolf games from disk; starting empty");
-                HashMap::new()
+                FoldHashMap::default()
             }
         };
         Arc::new(Self {
@@ -98,8 +98,8 @@ impl Bot {
             games: Mutex::new(games),
             wolf_games: Mutex::new(wolf_games),
             bot_open_id: Mutex::new(None),
-            seen_events: Mutex::new(HashMap::new()),
-            seen_actions: Mutex::new(HashMap::new()),
+            seen_events: Mutex::new(FoldHashMap::default()),
+            seen_actions: Mutex::new(FoldHashMap::default()),
             llm,
             store,
         })
@@ -148,11 +148,20 @@ impl Bot {
     /// observed in practice — the docs claim card callbacks aren't retried,
     /// but they sometimes are).
     pub(crate) fn is_duplicate_action(&self, action: &CardAction) -> bool {
-        let fingerprint = format!(
-            "{}|{}",
-            action.open_id,
-            serde_json::to_string(&action.value).unwrap_or_default()
-        );
+        // Hot-path fingerprint: hash `open_id || value-json` into a single
+        // `u64` via foldhash (the same hasher backing our `FoldHashMap`).
+        // Avoids the per-event `String` allocation the old `format!` did,
+        // and the dedup probe becomes a u64 hash instead of a string hash.
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut h = foldhash::fast::FixedState::default().build_hasher();
+        action.open_id.hash(&mut h);
+        // `Value`'s `Hash` impl is order-stable for objects iff serde_json
+        // preserves insertion order — which it does (preserve_order is on
+        // by default for Map). We additionally fold in the SIMD-stringified
+        // form so deeply nested objects can't collide.
+        let s = sonic_rs::to_string(&action.value).unwrap_or_default();
+        s.hash(&mut h);
+        let fingerprint = h.finish();
         let mut seen = self.seen_actions.lock();
         seen.retain(|_, t| t.elapsed() < Duration::from_secs(10));
         if let Some(first_seen) = seen.get(&fingerprint) {

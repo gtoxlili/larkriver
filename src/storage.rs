@@ -5,16 +5,21 @@
 //! with no joins, no queries, no aggregates. redb is single-file, zero-config,
 //! pure Rust (no C dep), ACID, and a few hundred KB of compiled code.
 //!
+//! Hot serialise / deserialise goes through [sonic-rs] (SIMD-accelerated JSON)
+//! instead of `serde_json` — the wire format is identical so existing redb
+//! files keep working.
+//!
 //! [redb]: https://github.com/cberner/redb
 
 use crate::game::Game;
 use crate::werewolf::WolfGame;
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
+
+use crate::util::FoldHashMap;
 
 const GAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("games");
 const WOLF_GAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("wolf_games");
@@ -44,7 +49,7 @@ impl Store {
     }
 
     pub fn save(&self, chat_id: &str, game: &Game) -> Result<()> {
-        let bytes = serde_json::to_vec(game)?;
+        let bytes = sonic_rs::to_vec(game)?;
         let txn = self.db.begin_write()?;
         {
             let mut t = txn.open_table(GAMES)?;
@@ -66,14 +71,14 @@ impl Store {
 
     /// Replay all persisted games. Bad / partially-written entries are
     /// dropped with a warning rather than aborting startup.
-    pub fn load_all(&self) -> Result<HashMap<String, Game>> {
+    pub fn load_all(&self) -> Result<FoldHashMap<String, Game>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(GAMES)?;
-        let mut out = HashMap::new();
+        let mut out = FoldHashMap::default();
         for kv in t.iter()? {
             let (k, v) = kv?;
             let key = k.value().to_string();
-            match serde_json::from_slice::<Game>(v.value()) {
+            match sonic_rs::from_slice::<Game>(v.value()) {
                 Ok(game) => {
                     out.insert(key, game);
                 }
@@ -86,7 +91,7 @@ impl Store {
     }
 
     pub fn save_wolf(&self, chat_id: &str, game: &WolfGame) -> Result<()> {
-        let bytes = serde_json::to_vec(game)?;
+        let bytes = sonic_rs::to_vec(game)?;
         let txn = self.db.begin_write()?;
         {
             let mut t = txn.open_table(WOLF_GAMES)?;
@@ -106,14 +111,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn load_all_wolf(&self) -> Result<HashMap<String, WolfGame>> {
+    pub fn load_all_wolf(&self) -> Result<FoldHashMap<String, WolfGame>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(WOLF_GAMES)?;
-        let mut out = HashMap::new();
+        let mut out = FoldHashMap::default();
         for kv in t.iter()? {
             let (k, v) = kv?;
             let key = k.value().to_string();
-            match serde_json::from_slice::<WolfGame>(v.value()) {
+            match sonic_rs::from_slice::<WolfGame>(v.value()) {
                 Ok(game) => {
                     out.insert(key, game);
                 }

@@ -12,10 +12,10 @@
 
 use crate::game::Persona;
 use crate::llm::LlmClient;
+use crate::util::{FastHashMap, FoldHashSet};
 use crate::werewolf::game::*;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
 use tracing::warn;
 
 // ============================================================================
@@ -181,11 +181,11 @@ impl<'a> PublicView<'a> {
     ///
     /// 返回 `(idx, name, alive, lines)`，按 idx 排序。
     fn build_dossiers(&self) -> Vec<(usize, String, bool, Vec<String>)> {
-        let mut by_player: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut by_player: FastHashMap<usize, Vec<String>> = FastHashMap::default();
 
         // 已结算的白天（DayLynch 已写入）—— 这些天的投票才公开，
         // 当天还在进行中的投票（DayVote 阶段）不能让下一个投票的 AI 偷看。
-        let resolved_lynch_days: std::collections::HashSet<u32> = self
+        let resolved_lynch_days: FoldHashSet<u32> = self
             .recap_log
             .iter()
             .filter_map(|e| match e {
@@ -583,7 +583,7 @@ pub async fn wolf_pick(
     );
 
     match chat_with_history(llm, system, user, history).await {
-        Ok(content) => match serde_json::from_str::<WolfPickResp>(&content) {
+        Ok(content) => match sonic_rs::from_str::<WolfPickResp>(&content) {
             Ok(r) => {
                 let target_idx = if candidates.iter().any(|(i, _)| *i == r.target_idx) {
                     r.target_idx
@@ -671,7 +671,7 @@ pub async fn seer_pick(
     );
 
     match chat_with_history(llm, system, user, history).await {
-        Ok(content) => match serde_json::from_str::<SeerCheckResp>(&content) {
+        Ok(content) => match sonic_rs::from_str::<SeerCheckResp>(&content) {
             Ok(r) => {
                 let target = if candidates.iter().any(|(i, _)| *i == r.target_idx) {
                     r.target_idx
@@ -764,7 +764,7 @@ pub async fn witch_decide(
             return (WitchDecision::Skip, None);
         }
     };
-    let parsed: WitchResp = match serde_json::from_str(&raw) {
+    let parsed: WitchResp = match sonic_rs::from_str(&raw) {
         Ok(r) => r,
         Err(e) => {
             warn!(?e, content = %raw, "witch JSON parse failed");
@@ -862,7 +862,7 @@ pub async fn vote_pick(
             return (VoteDecision { target_idx: None }, None);
         }
     };
-    let parsed: VoteResp = match serde_json::from_str(&raw) {
+    let parsed: VoteResp = match sonic_rs::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "vote JSON parse failed");
@@ -941,7 +941,7 @@ pub async fn hunter_pick(
             return (None, None);
         }
     };
-    let parsed: HunterResp = match serde_json::from_str(&raw) {
+    let parsed: HunterResp = match sonic_rs::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "hunter JSON parse failed");
@@ -1018,7 +1018,7 @@ pub async fn guard_pick(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match serde_json::from_str::<GuardResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<GuardResp>(&c) {
             Ok(r) if candidates.iter().any(|(i, _)| *i == r.target_idx) => {
                 (r.target_idx, norm_thinking(r.thinking))
             }
@@ -1063,7 +1063,7 @@ pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> (bool, Optio
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<SheriffRunResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<SheriffRunResp>(&c) {
             Ok(r) => (r.run, norm_thinking(r.thinking)),
             Err(e) => {
                 warn!(?e, content = %c, "sheriff_run JSON parse failed");
@@ -1121,7 +1121,7 @@ pub async fn sheriff_vote(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match serde_json::from_str::<SheriffVoteResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<SheriffVoteResp>(&c) {
             Ok(r) => {
                 let target = if r.target_idx >= 0 {
                     let idx = r.target_idx as usize;
@@ -1192,7 +1192,7 @@ pub async fn badge_pass(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match serde_json::from_str::<BadgeResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<BadgeResp>(&c) {
             Ok(r) => {
                 let target = if r.target_idx >= 0 {
                     let idx = r.target_idx as usize;
@@ -1247,7 +1247,7 @@ pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, 
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1299,7 +1299,7 @@ pub async fn sheriff_direction(llm: &LlmClient, view: &PublicView<'_>) -> (bool,
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<DirResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<DirResp>(&c) {
             Ok(r) => (r.clockwise, norm_thinking(r.thinking)),
             Err(_) => (true, None), // 默认警上
         },
@@ -1330,7 +1330,7 @@ pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1432,7 +1432,7 @@ pub async fn dying_hunter_combined(
             );
         }
     };
-    let parsed: DyingShooterResp = match serde_json::from_str(&raw) {
+    let parsed: DyingShooterResp = match sonic_rs::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "dying_hunter_combined JSON parse failed");
@@ -1487,7 +1487,7 @@ pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match serde_json::from_str::<SpeechResp>(&c) {
+        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1515,7 +1515,7 @@ pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
 /// 把 (potentially) failed JSON parse into anyhow context for fmt'ing.
 #[allow(dead_code)]
 fn parse_or_err<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T> {
-    serde_json::from_str(s).with_context(|| format!("LLM JSON: {s}"))
+    sonic_rs::from_str(s).with_context(|| format!("LLM JSON: {s}"))
 }
 
 #[cfg(test)]

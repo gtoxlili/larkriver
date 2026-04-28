@@ -1,24 +1,72 @@
 [package]
 name = "larkriver"
-version = "0.1.0"
-edition = "2021"
-description = "Texas Hold'em poker bot for Feishu (Lark) group chats"
+version = "0.2.0"
+edition = "2024"
+description = "Texas Hold'em + Werewolf bot for Feishu (Lark) — 2026 aggressive rewrite"
+rust-version = "1.85"
 
 [dependencies]
-tokio = { version = "1.52", features = ["full"] }
+# --- async runtime / web -------------------------------------------------
+tokio = { version = "1.52", features = ["full", "parking_lot"] }
 axum = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "webpki-roots",
+    "http2",
+    "gzip",
+    "brotli",
+    "zstd",
+    "stream",
+] }
+
+# --- serde stack ---------------------------------------------------------
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rand = "0.10"
+# SIMD-accelerated JSON. We use it for hot-path encode/decode (storage,
+# webhook bodies, card content stringification). serde_json is still around
+# for the json!{} macro and in-memory Value building.
+sonic-rs = "0.5"
+
+# --- hashing / collections ----------------------------------------------
+# foldhash beats ahash on modern CPUs and is what hashbrown is moving toward
+# upstream. We use it for every HashMap/HashSet outside std.
+foldhash = "0.2"
+hashbrown = { version = "0.16", features = ["serde", "default-hasher"] }
+# Inline small Vec<T> when ≤ N items: hole cards (always 2), nominators,
+# action logs early in a hand, etc. 2.x is the const-generic refresh.
+smallvec = { version = "2.0.0-alpha.12", features = ["serde"] }
+
+# --- randomness ----------------------------------------------------------
+# fastrand is dramatically faster than rand for non-crypto needs (shuffle,
+# choose, persona pick). Single-threaded thread-local PRNG.
+fastrand = "2"
+
+# --- parallelism ---------------------------------------------------------
+# Equity Monte Carlo is embarrassingly parallel — rayon gives us a free
+# n-core speedup on the AI's pre-decision equity sim.
+rayon = "1.12"
+
+# --- concurrency primitives ---------------------------------------------
+parking_lot = "0.12"
+# Lock-free atomic snapshot for the Feishu tenant-access-token cache.
+# Token reads happen on every API call (high-fan-out) — arc-swap turns
+# that into an Atomic load instead of a Mutex acquire.
+arc-swap = "1.9"
+
+# --- everything else (kept) ---------------------------------------------
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
-parking_lot = "0.12"
 itertools = "0.14"
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "v7", "fast-rng"] }
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion"] }
 redb = "4"
+
+# --- allocator (global) -------------------------------------------------
+# mimalloc gives a 5–15 % win on alloc-heavy workloads (JSON / Vec churn,
+# webhook handler tasks, LLM message construction). Wired in main.rs.
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
@@ -26,8 +74,6 @@ lto = "fat"          # whole-program LTO across crates
 codegen-units = 1    # one codegen unit, slowest compile / smallest+fastest binary
 strip = "symbols"    # drop symbol tables from the final binary
 
-# Faster incremental dev builds — keep dev deps in release-style optimisation
-# so cargo test isn't painfully slow once we bump the release profile.
 [profile.dev.package."*"]
 opt-level = 1
 

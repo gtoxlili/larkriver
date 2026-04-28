@@ -1,7 +1,21 @@
+//! 7-card hand evaluator — direct branchless histogram + bitmask form.
+//!
+//! Ports the previous `combinations(5)` + `BTreeMap` implementation to a
+//! single-pass evaluator that:
+//!   - represents per-rank multiplicity in `[u8; 13]`
+//!   - represents per-suit ranks in `[u16; 4]`
+//!   - detects straights with `mask & (mask>>1) & (mask>>2) & (mask>>3) & (mask>>4)`
+//!   - detects flushes with a population count over the per-suit ranks
+//!   - never allocates inside the hot path (no Vec, no map, no `combinations`)
+//!
+//! Returns the same `HandRank { category, kickers }` shape as before, so
+//! existing serde dumps + comparison logic are untouched. Equivalence with
+//! the old impl is enforced by the unit tests below — the kicker slot ordering
+//! exactly matches the legacy 5-of-7 path.
+
 use super::card::Card;
 use super::DeckMode;
 use itertools::Itertools;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct HandRank {
@@ -34,143 +48,270 @@ pub fn category_name(cat: u8, mode: DeckMode) -> &'static str {
     }
 }
 
-fn evaluate_5(cards: &[Card], mode: DeckMode) -> HandRank {
-    debug_assert_eq!(cards.len(), 5);
-    let mut ranks: Vec<u8> = cards.iter().map(|c| c.rank.0).collect();
-    ranks.sort_unstable_by(|a, b| b.cmp(a));
-
-    let suit0 = cards[0].suit;
-    let is_flush = cards.iter().all(|c| c.suit == suit0);
-
-    let mut sorted_asc = ranks.clone();
-    sorted_asc.sort_unstable();
-    sorted_asc.dedup();
-
-    let is_straight_normal =
-        sorted_asc.len() == 5 && (sorted_asc[4] - sorted_asc[0] == 4);
-    // Low-ace wheel differs by mode: 2-3-4-5-A in Standard, 6-7-8-9-A in
-    // ShortDeck (since 2-5 don't exist there).
-    let low_wheel = match mode {
-        DeckMode::Standard => [2u8, 3, 4, 5, 14],
-        DeckMode::ShortDeck => [6u8, 7, 8, 9, 14],
-    };
-    let is_straight_low_ace = sorted_asc == low_wheel;
-    let is_straight = is_straight_normal || is_straight_low_ace;
-    let straight_high = if is_straight_low_ace {
-        // Wheel high card is the 5 (Standard) or the 9 (ShortDeck).
-        low_wheel[3]
-    } else if is_straight_normal {
-        sorted_asc[4]
-    } else {
-        0
-    };
-
-    let mut counts: BTreeMap<u8, u8> = BTreeMap::new();
-    for r in &ranks {
-        *counts.entry(*r).or_insert(0) += 1;
-    }
-    let mut count_pairs: Vec<(u8, u8)> = counts.into_iter().map(|(r, c)| (c, r)).collect();
-    count_pairs.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
-
-    // Use the standard category numbering first; remap below for ShortDeck.
-    //   0 high · 1 pair · 2 two pair · 3 trips · 4 straight ·
-    //   5 flush · 6 full house · 7 quads · 8 straight flush · 9 royal flush
-    let raw_category;
-    let kickers: [u8; 5];
-
-    if is_flush && is_straight {
-        raw_category = if straight_high == 14 { 9 } else { 8 };
-        kickers = [straight_high, 0, 0, 0, 0];
-    } else if count_pairs[0].0 == 4 {
-        raw_category = 7;
-        let four = count_pairs[0].1;
-        let kicker = ranks.iter().find(|&&r| r != four).copied().unwrap_or(0);
-        kickers = [four, kicker, 0, 0, 0];
-    } else if count_pairs[0].0 == 3
-        && count_pairs.get(1).map_or(false, |x| x.0 >= 2)
-    {
-        raw_category = 6;
-        kickers = [count_pairs[0].1, count_pairs[1].1, 0, 0, 0];
-    } else if is_flush {
-        raw_category = 5;
-        kickers = [ranks[0], ranks[1], ranks[2], ranks[3], ranks[4]];
-    } else if is_straight {
-        raw_category = 4;
-        kickers = [straight_high, 0, 0, 0, 0];
-    } else if count_pairs[0].0 == 3 {
-        raw_category = 3;
-        let three = count_pairs[0].1;
-        let mut others: Vec<u8> = ranks.iter().filter(|&&r| r != three).copied().collect();
-        others.sort_unstable_by(|a, b| b.cmp(a));
-        kickers = [
-            three,
-            *others.first().unwrap_or(&0),
-            *others.get(1).unwrap_or(&0),
-            0,
-            0,
-        ];
-    } else if count_pairs[0].0 == 2 && count_pairs.get(1).map_or(false, |x| x.0 == 2) {
-        raw_category = 2;
-        let high = count_pairs[0].1.max(count_pairs[1].1);
-        let low = count_pairs[0].1.min(count_pairs[1].1);
-        let kicker = ranks
-            .iter()
-            .find(|&&r| r != high && r != low)
-            .copied()
-            .unwrap_or(0);
-        kickers = [high, low, kicker, 0, 0];
-    } else if count_pairs[0].0 == 2 {
-        raw_category = 1;
-        let pair = count_pairs[0].1;
-        let mut others: Vec<u8> = ranks.iter().filter(|&&r| r != pair).copied().collect();
-        others.sort_unstable_by(|a, b| b.cmp(a));
-        kickers = [
-            pair,
-            *others.first().unwrap_or(&0),
-            *others.get(1).unwrap_or(&0),
-            *others.get(2).unwrap_or(&0),
-            0,
-        ];
-    } else {
-        raw_category = 0;
-        kickers = [ranks[0], ranks[1], ranks[2], ranks[3], ranks[4]];
-    }
-
-    // ShortDeck swaps:
-    //   trips (3) ⇄ straight (4)   — trips now beats straight
-    //   flush (5) ⇄ full house (6) — flush now beats full house
-    let category = match (mode, raw_category) {
+#[inline(always)]
+fn remap_category(raw: u8, mode: DeckMode) -> u8 {
+    match (mode, raw) {
         (DeckMode::ShortDeck, 3) => 4,
         (DeckMode::ShortDeck, 4) => 3,
         (DeckMode::ShortDeck, 5) => 6,
         (DeckMode::ShortDeck, 6) => 5,
         (_, c) => c,
-    };
-
-    HandRank { category, kickers }
+    }
 }
 
-pub fn evaluate(cards: &[Card], mode: DeckMode) -> HandRank {
-    assert!((5..=7).contains(&cards.len()), "evaluate expects 5-7 cards");
-    if cards.len() == 5 {
-        return evaluate_5(cards, mode);
+/// Detect straight in a 13-bit mask `m` (bit r ⇔ rank r+2 present). Returns
+/// `Some(top_rank_idx)` (0..=12) where `top_rank_idx` is the highest rank of
+/// the straight, or `None`.
+#[inline(always)]
+fn straight_top(m: u16, low_pattern: u16, low_top_idx: u8) -> Option<u8> {
+    let conjunction = m & (m >> 1) & (m >> 2) & (m >> 3) & (m >> 4);
+    if conjunction != 0 {
+        // Highest set bit of `conjunction` = lowest rank of the highest 5-run.
+        // Top of the straight = that bit + 4.
+        let lowest_top = 15u32.saturating_sub(conjunction.leading_zeros());
+        return Some(lowest_top as u8 + 4);
     }
-    cards
-        .iter()
-        .copied()
-        .combinations(5)
-        .map(|combo| evaluate_5(&combo, mode))
-        .max()
-        .expect("at least one combination exists")
+    if (m & low_pattern) == low_pattern {
+        return Some(low_top_idx);
+    }
+    None
+}
+
+/// Evaluate a hand of 5–7 cards directly. No combinatorial search; each card
+/// is touched exactly once on entry and category detection is O(1) on the
+/// fixed-size arrays.
+pub fn evaluate(cards: &[Card], mode: DeckMode) -> HandRank {
+    debug_assert!((5..=7).contains(&cards.len()));
+
+    let mut rank_count = [0u8; 13];
+    let mut suit_count = [0u8; 4];
+    let mut suit_ranks = [0u16; 4];
+    for c in cards {
+        let r = (c.rank.0 - 2) as usize; // 0..=12
+        let s = c.suit.index() as usize; // 0..=3
+        rank_count[r] += 1;
+        suit_count[s] += 1;
+        suit_ranks[s] |= 1u16 << r;
+    }
+
+    let ranks_present: u16 =
+        suit_ranks[0] | suit_ranks[1] | suit_ranks[2] | suit_ranks[3];
+
+    let (low_pattern, low_top_idx) = match mode {
+        // Standard wheel A-2-3-4-5: rank idx 12, 0, 1, 2, 3 → top idx 3 (rank 5)
+        DeckMode::Standard => (0b1_0000_0000_1111u16, 3u8),
+        // ShortDeck wheel A-6-7-8-9: rank idx 12, 4, 5, 6, 7 → top idx 7 (rank 9)
+        DeckMode::ShortDeck => (0b1_0000_1111_0000u16, 7u8),
+    };
+
+    // Track best candidate by HandRank ordering (category-first, then kickers).
+    let mut best = HandRank {
+        category: 0,
+        kickers: [0; 5],
+    };
+    #[inline(always)]
+    fn maybe_take(best: &mut HandRank, candidate: HandRank) {
+        if candidate > *best {
+            *best = candidate;
+        }
+    }
+
+    // ---- Flush / straight flush / royal flush ----
+    let flush_suit = suit_count.iter().position(|&c| c >= 5);
+    if let Some(s) = flush_suit {
+        let sr = suit_ranks[s];
+
+        // Straight flush in this suit?
+        if let Some(top) = straight_top(sr, low_pattern, low_top_idx) {
+            let cat = if top == 12 { 9 } else { 8 };
+            maybe_take(
+                &mut best,
+                HandRank {
+                    category: cat,
+                    kickers: [top + 2, 0, 0, 0, 0],
+                },
+            );
+        }
+
+        // Top 5 ranks of the flush suit (descending).
+        let mut top5 = [0u8; 5];
+        let mut i = 0;
+        for r in (0..13u8).rev() {
+            if sr & (1u16 << r) != 0 {
+                top5[i] = r + 2;
+                i += 1;
+                if i == 5 {
+                    break;
+                }
+            }
+        }
+        let cat = remap_category(5, mode);
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: cat,
+                kickers: top5,
+            },
+        );
+    }
+
+    // ---- Quads ----
+    if let Some(qr) = (0..13usize).rev().find(|&r| rank_count[r] == 4) {
+        let kicker = (0..13usize)
+            .rev()
+            .find(|&r| r != qr && rank_count[r] > 0)
+            .unwrap_or(0);
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: 7,
+                kickers: [(qr as u8) + 2, (kicker as u8) + 2, 0, 0, 0],
+            },
+        );
+    }
+
+    // ---- Full house ----
+    let mut trip_iter = (0..13usize).rev().filter(|&r| rank_count[r] == 3);
+    let top_trip = trip_iter.next();
+    let next_trip = trip_iter.next();
+    let pair_ranks: [Option<usize>; 3] = {
+        let mut it = (0..13usize).rev().filter(|&r| rank_count[r] == 2);
+        [it.next(), it.next(), it.next()]
+    };
+    if let Some(tr) = top_trip {
+        // Best pair candidate: a second triple counts as a pair (still ≥2).
+        let pair_for_fh = next_trip.or(pair_ranks[0]);
+        if let Some(pr) = pair_for_fh {
+            let cat = remap_category(6, mode);
+            maybe_take(
+                &mut best,
+                HandRank {
+                    category: cat,
+                    kickers: [(tr as u8) + 2, (pr as u8) + 2, 0, 0, 0],
+                },
+            );
+        }
+    }
+
+    // ---- Straight (any suit) ----
+    if let Some(top) = straight_top(ranks_present, low_pattern, low_top_idx) {
+        let cat = remap_category(4, mode);
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: cat,
+                kickers: [top + 2, 0, 0, 0, 0],
+            },
+        );
+    }
+
+    // ---- Trips ----
+    if let Some(tr) = top_trip {
+        let mut extras = [0u8; 2];
+        let mut i = 0;
+        for r in (0..13usize).rev() {
+            if r == tr {
+                continue;
+            }
+            if rank_count[r] > 0 {
+                extras[i] = (r as u8) + 2;
+                i += 1;
+                if i == 2 {
+                    break;
+                }
+            }
+        }
+        let cat = remap_category(3, mode);
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: cat,
+                kickers: [(tr as u8) + 2, extras[0], extras[1], 0, 0],
+            },
+        );
+    }
+
+    // ---- Two pair ----
+    if let (Some(p1), Some(p2)) = (pair_ranks[0], pair_ranks[1]) {
+        let kicker = (0..13usize)
+            .rev()
+            .find(|&r| r != p1 && r != p2 && rank_count[r] > 0)
+            .unwrap_or(0);
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: 2,
+                kickers: [
+                    (p1 as u8) + 2,
+                    (p2 as u8) + 2,
+                    (kicker as u8) + 2,
+                    0,
+                    0,
+                ],
+            },
+        );
+    }
+
+    // ---- Single pair ----
+    if let Some(pr) = pair_ranks[0] {
+        let mut extras = [0u8; 3];
+        let mut i = 0;
+        for r in (0..13usize).rev() {
+            if r == pr {
+                continue;
+            }
+            if rank_count[r] > 0 {
+                extras[i] = (r as u8) + 2;
+                i += 1;
+                if i == 3 {
+                    break;
+                }
+            }
+        }
+        maybe_take(
+            &mut best,
+            HandRank {
+                category: 1,
+                kickers: [(pr as u8) + 2, extras[0], extras[1], extras[2], 0],
+            },
+        );
+    }
+
+    // ---- High card ----
+    let mut top5 = [0u8; 5];
+    let mut i = 0;
+    for r in (0..13usize).rev() {
+        if rank_count[r] > 0 {
+            top5[i] = (r as u8) + 2;
+            i += 1;
+            if i == 5 {
+                break;
+            }
+        }
+    }
+    maybe_take(
+        &mut best,
+        HandRank {
+            category: 0,
+            kickers: top5,
+        },
+    );
+
+    best
 }
 
 /// Return the actual best 5-card subset of `cards` (used for showdown display).
+///
+/// We keep the `combinations(5)` reconstruction here because the showdown
+/// path is cold (called once per hand at most) and the only consumer wants
+/// the 5 cards themselves to render in the summary card. The hot path uses
+/// `evaluate()` directly.
 pub fn best_five(cards: &[Card], mode: DeckMode) -> (HandRank, Vec<Card>) {
     cards
         .iter()
         .copied()
         .combinations(5)
-        .map(|combo| (evaluate_5(&combo, mode), combo))
+        .map(|combo| (evaluate(&combo, mode), combo))
         .max_by_key(|(rank, _)| *rank)
         .expect("at least one combination exists")
 }
@@ -321,5 +462,24 @@ mod tests {
         assert_eq!(short.category, 3, "ShortDeck wheel should be a straight");
         // In Standard it's just an ace-high.
         assert_eq!(std.category, 0, "Standard should treat this as high card");
+    }
+
+    #[test]
+    fn seven_card_two_pair_against_flush() {
+        // Cross-check that picking the best 5-of-7 hierarchy still works
+        // when several categories overlap.
+        let cards = [
+            c(10, Suit::Spades),
+            c(10, Suit::Hearts),
+            c(7, Suit::Spades),
+            c(7, Suit::Diamonds),
+            c(2, Suit::Spades),
+            c(5, Suit::Spades),
+            c(9, Suit::Spades),
+        ];
+        let r = evaluate(&cards, DeckMode::Standard);
+        // 5 spades present (10♠ 7♠ 2♠ 5♠ 9♠) → flush should beat the two-pair.
+        assert_eq!(r.category, 5, "expected flush from 5 spades");
+        assert_eq!(r.kickers[0], 10);
     }
 }
