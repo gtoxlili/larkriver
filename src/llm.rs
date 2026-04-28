@@ -95,52 +95,87 @@ impl LlmClient {
         &self,
         msgs: &[(String, String)],
     ) -> Result<String> {
-        let mut request_msgs = Vec::with_capacity(msgs.len());
-        for (role, content) in msgs {
-            let m: async_openai::types::ChatCompletionRequestMessage = match role.as_str() {
+        // (role, content) → 库内的 message 类型
+        let to_lib_msg = |role: &str,
+                          content: &str|
+         -> Result<async_openai::types::ChatCompletionRequestMessage> {
+            Ok(match role {
                 "system" => ChatCompletionRequestSystemMessageArgs::default()
-                    .content(content.as_str())
+                    .content(content)
                     .build()?
                     .into(),
                 "user" => ChatCompletionRequestUserMessageArgs::default()
-                    .content(content.as_str())
+                    .content(content)
                     .build()?
                     .into(),
                 "assistant" => ChatCompletionRequestAssistantMessageArgs::default()
-                    .content(content.as_str())
+                    .content(content)
                     .build()?
                     .into(),
                 other => return Err(anyhow!("unknown chat role: {other}")),
-            };
-            request_msgs.push(m);
-        }
-        let req = CreateChatCompletionRequestArgs::default()
-            .model(&self.model)
-            .messages(request_msgs)
-            .response_format(ResponseFormat::JsonObject)
-            .temperature(0.9)
-            .build()?;
-        let response = self.client.chat().create(req).await?;
-        let choice = response
-            .choices
-            .first()
-            .ok_or_else(|| anyhow!("empty LLM response (no choices)"))?;
-        let content = choice
-            .message
-            .content
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("");
-        if content.is_empty() {
-            let reason = choice
+            })
+        };
+
+        // 起手 messages = caller 传入的 system / user / 历次失败链
+        let mut chain: Vec<(String, String)> = msgs.to_vec();
+
+        // DeepSeek（和部分 OpenAI 兼容 provider）在 response_format=json_object 模式下
+        // 偶发返回 finish_reason=Stop + content="" —— 启发式自纠：把空回复 + 修正提示
+        // 追加进对话历史，让 LLM 看到自己刚才输出空了，重新按要求格式输出。
+        // 思路和 retry-with-feedback 一致，只是 feedback 内容针对的是空内容。
+        const MAX_ATTEMPTS: usize = 4;
+        let mut last_reason = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut request_msgs = Vec::with_capacity(chain.len());
+            for (role, content) in &chain {
+                request_msgs.push(to_lib_msg(role, content)?);
+            }
+            let req = CreateChatCompletionRequestArgs::default()
+                .model(&self.model)
+                .messages(request_msgs)
+                .response_format(ResponseFormat::JsonObject)
+                .temperature(0.9)
+                .build()?;
+
+            let response = self.client.chat().create(req).await?;
+            let choice = response
+                .choices
+                .first()
+                .ok_or_else(|| anyhow!("empty LLM response (no choices)"))?;
+            let content = choice
+                .message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if !content.is_empty() {
+                return Ok(content);
+            }
+            last_reason = choice
                 .finish_reason
                 .map(|r| format!("{r:?}"))
                 .unwrap_or_else(|| "unknown".into());
-            return Err(anyhow!(
-                "LLM returned empty content (finish_reason={reason})"
+            tracing::debug!(
+                attempt = attempt + 1,
+                reason = %last_reason,
+                "LLM returned empty content, appending corrective feedback and retrying"
+            );
+            // 把空回复挂进对话历史 + user 消息要求他重新按格式输出
+            chain.push(("assistant".into(), String::new()));
+            chain.push((
+                "user".into(),
+                format!(
+                    "⚠️ 你刚才返回了**空内容**（finish_reason={last_reason}）。\
+                     请按上面 system / user 消息里要求的 JSON 格式重新输出一遍——\
+                     **必须返回一个非空的合法 JSON 对象**，不要返回空字符串、\
+                     不要返回任何 markdown 或代码块。"
+                ),
             ));
         }
-        Ok(content.to_string())
+        Err(anyhow!(
+            "LLM kept returning empty content after {MAX_ATTEMPTS} attempts (last finish_reason={last_reason})"
+        ))
     }
 
     /// Ask the LLM to pick an action. Returns a clamped, legal action plus
@@ -160,54 +195,14 @@ impl LlmClient {
     }
 
     async fn try_decide(&self, ctx: &DecisionContext) -> Result<AiDecision> {
-        let system = system_prompt(ctx.persona);
-        let prompt = build_prompt(ctx);
-        let req = CreateChatCompletionRequestArgs::default()
-            .model(&self.model)
-            .messages([
-                ChatCompletionRequestSystemMessageArgs::default()
-                    .content(system)
-                    .build()?
-                    .into(),
-                ChatCompletionRequestUserMessageArgs::default()
-                    .content(prompt)
-                    .build()?
-                    .into(),
+        // 走和狼人杀同一条路径：chat_json_with_messages 内部会处理空内容自纠重试。
+        let content = self
+            .chat_json_with_messages(&[
+                ("system".into(), system_prompt(ctx.persona)),
+                ("user".into(), build_prompt(ctx)),
             ])
-            .response_format(ResponseFormat::JsonObject)
-            // Higher temperature so the AI's play has personality / variance —
-            // casual chat-room poker is more fun if the bot doesn't always pick
-            // the same action in the same spot. reasoning_effort defaults to
-            // "high" for normal requests on V4 models (only auto-bumps to
-            // "max" for agent-style calls), which is what we want — leaving
-            // it unset.
-            .temperature(0.9)
-            // 不设 max_tokens —— reasoning 模型的思考 token 也算 max_tokens，
-            // 给小了会被截断（content 空 / JSON 写到一半），不如让模型自己决定。
-            .build()?;
-
-        let response = self.client.chat().create(req).await?;
-        let choice = response
-            .choices
-            .first()
-            .ok_or_else(|| anyhow!("empty LLM response (no choices)"))?;
-        let content = choice
-            .message
-            .content
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("");
-        if content.is_empty() {
-            // reasoning 模型在 max_tokens 不够时会返回 content 为空 / 全空白，
-            // finish_reason=length。给一条明确的错误，别让下游 serde 报
-            // "EOF while parsing" 这种误导性信息。
-            let reason = choice
-                .finish_reason
-                .map(|r| format!("{r:?}"))
-                .unwrap_or_else(|| "unknown".into());
-            return Err(anyhow!("LLM returned empty content (finish_reason={reason})"));
-        }
-        let raw: RawDecision = serde_json::from_str(content)
+            .await?;
+        let raw: RawDecision = serde_json::from_str(&content)
             .with_context(|| format!("LLM bad JSON: {content}"))?;
         let quip = raw
             .quip
