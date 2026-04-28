@@ -9,7 +9,8 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ResponseFormat,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ReasoningEffort,
+        ResponseFormat,
     },
     Client,
 };
@@ -130,11 +131,16 @@ impl LlmClient {
             for (role, content) in &chain {
                 request_msgs.push(to_lib_msg(role, content)?);
             }
+            // temperature 0.6：之前 0.9 多样性好但逻辑松散，调低后 LLM
+            // 推理更紧凑（实测 0.9 会让狼人杀 AI 套话术、跟风、自相矛盾）。
+            // reasoning_effort=High：尽量让模型多走几层思考链。async-openai
+            // 0.27 没有 Max 变体，这是当前枚举的最高档。
             let req = CreateChatCompletionRequestArgs::default()
                 .model(&self.model)
                 .messages(request_msgs)
                 .response_format(ResponseFormat::JsonObject)
-                .temperature(0.9)
+                .temperature(0.6)
+                .reasoning_effort(ReasoningEffort::High)
                 .build()?;
 
             let response = self.client.chat().create(req).await?;
