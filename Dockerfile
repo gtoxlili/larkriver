@@ -1,13 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---------- planner: hash the dependency graph (cargo-chef recipe) ----------
-# Pin the builder to Debian bookworm (glibc 2.36) so the linked binary stays
-# compatible with our `distroless/cc-debian12` runtime. The `*-rust-latest`
-# tag silently follows Debian's stable cut and once Trixie (glibc 2.38)
-# became upstream-stable the produced binary stopped loading on bookworm
-# with `GLIBC_2.38 not found`. Pinning the OS layer keeps the toolchain
-# moving forward without dragging the libc floor with it.
-FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS chef
 WORKDIR /app
 
 FROM chef AS planner
@@ -41,11 +35,12 @@ RUN cargo build --release --locked
 # `mkdir` or `chown` in the runtime stage directly.
 RUN mkdir -p /datadir
 
-# ---------- runtime: distroless cc, ≈ 32 MB final image, runs as nonroot.
+# ---------- runtime: distroless cc on Debian 13 (trixie / glibc 2.38),
+# matched to the cargo-chef builder's libc so the binary actually loads.
 # Note: must be `cc` (= base + libgcc + libstdc++), NOT `base`. Rust's default
 # `panic = unwind` dlopens libgcc_s.so.1 at runtime; without it the binary
 # fails to start with "error while loading shared libraries: libgcc_s.so.1".
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=builder /app/target/release/larkriver /app/larkriver
 # Pre-create /data owned by uid 65532 (`nonroot`). When users mount a fresh
 # named docker volume here, Docker initialises it from this directory and
