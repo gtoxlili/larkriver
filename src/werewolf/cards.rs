@@ -304,12 +304,13 @@ pub fn build_wolf_night_card(game: &WolfGame, viewer: &Player) -> Value {
         ])],
     ));
 
-    // 4. 目标选择按钮
+    // 4. 目标选择按钮 —— 包括狼队友 / 自己:狼方可以"自刀"做策略
+    //    (送验、骗药、自爆诱饵)。UI 不主动隐藏队友,把决策权留给玩家。
     let targets: Vec<(usize, &Player)> = game
         .players
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.alive && !p.role.map(|r| r.is_wolf()).unwrap_or(false))
+        .filter(|(_, p)| p.alive)
         .collect();
     elements.push(markdown("**选择目标：**"));
     let buttons = target_buttons(

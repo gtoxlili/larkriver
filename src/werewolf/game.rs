@@ -794,9 +794,10 @@ impl WolfGame {
         if !self.players[target_idx].alive {
             return Err(anyhow!("不能选择已死亡的玩家"));
         }
-        if self.is_wolf(target_idx) {
-            return Err(anyhow!("不能选择狼队友"));
-        }
+        // 不再禁止"自刀"(刀狼队友 / 刀自己) —— 这是狼方合法策略:
+        // 送验(让女巫看到非狼死亡现场骗药 / 让预言家觉得自己查的不是狼)、
+        // 救场、自爆诱饵。严格规则上,被自刀的狼仍按"夜间被刀"结算 —— 守卫
+        // 同守同救等保护规则照常生效,猎人/狼王临死开枪规则也走原路径。
         // 替换或追加这只狼的投票
         if let Some(slot) = self
             .wolf_kill_votes

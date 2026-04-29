@@ -1267,10 +1267,19 @@ impl Bot {
                             let fallback = {
                                 let games = self.wolf_games.lock();
                                 games.get(chat_id).and_then(|g| {
+                                    // 兜底优先选非狼好人(更"正常"的狼刀路径),
+                                    // 实在没有再退到任意存活玩家(无好人=游戏
+                                    // 已经接近结束,基本不会进这条分支)。
                                     g.players
                                         .iter()
                                         .enumerate()
                                         .find(|(i, p)| p.alive && !g.is_wolf(*i))
+                                        .or_else(|| {
+                                            g.players
+                                                .iter()
+                                                .enumerate()
+                                                .find(|(_, p)| p.alive)
+                                        })
                                         .map(|(_, p)| p.open_id.clone())
                                 })
                             };
