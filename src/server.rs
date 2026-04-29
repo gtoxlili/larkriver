@@ -1,5 +1,5 @@
 use crate::bot::Bot;
-use crate::feishu::events::{parse_card_action, parse_inbound_message, parse_member_added};
+use crate::feishu::events::{parse_bot_added, parse_card_action, parse_inbound_message, parse_member_added};
 use anyhow::Result;
 use axum::{
     body::Bytes,
@@ -21,7 +21,7 @@ struct AppState {
 pub async fn run(bot: Arc<Bot>, addr: &str) -> Result<()> {
     let state = AppState { bot };
     let app = Router::new()
-        .route("/", get(|| async { "lark-arena 🎰🐺" }))
+        .route("/", get(|| async { "夜局 · lark-arena 🎰🐺" }))
         .route("/healthz", get(|| async { "ok" }))
         .route("/webhook/event", post(event_handler))
         .route("/webhook/card", post(card_handler))
@@ -97,6 +97,16 @@ async fn event_handler(State(state): State<AppState>, body_bytes: Bytes) -> impl
                 tokio::spawn(async move {
                     if let Err(e) = bot.handle_member_added(evt).await {
                         warn!(?e, "member_added handler error");
+                    }
+                });
+            }
+        }
+        "im.chat.member.bot.added_v1" => {
+            if let Some(evt) = parse_bot_added(&body) {
+                let bot = state.bot.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bot.handle_bot_added(evt).await {
+                        warn!(?e, "bot_added handler error");
                     }
                 });
             }

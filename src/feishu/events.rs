@@ -127,6 +127,41 @@ pub fn parse_member_added(payload: &Value) -> Option<MemberAdded> {
     }
 }
 
+/// `im.chat.member.bot.added_v1` payload — fired by Feishu when **the bot
+/// itself** is added to a group. Distinct from `user.added_v1` (a regular
+/// member joining); we use this to drop a public welcome card into the new
+/// chat so the room knows the bot just arrived and what it can do.
+#[derive(Debug, Clone)]
+pub struct BotAdded {
+    pub event_id: String,
+    pub chat_id: String,
+    /// open_id of the user who pulled the bot in (may be empty in older
+    /// payload variants — we degrade to "群主" / silent in that case).
+    pub operator_open_id: String,
+}
+
+pub fn parse_bot_added(payload: &Value) -> Option<BotAdded> {
+    let event_id = payload
+        .pointer("/header/event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let event = payload.get("event").unwrap_or(payload);
+    let chat_id = event.get("chat_id")?.as_str()?.to_string();
+    // operator_id is technically required by Feishu but we don't hard-fail
+    // on its absence — the welcome card still makes sense without it.
+    let operator_open_id = event
+        .pointer("/operator_id/open_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(BotAdded {
+        event_id,
+        chat_id,
+        operator_open_id,
+    })
+}
+
 /// Card action payload comes in two slightly different shapes depending on the
 /// "Card Callback" version selected in the bot's settings. Try both.
 pub fn parse_card_action(payload: &Value) -> Option<CardAction> {

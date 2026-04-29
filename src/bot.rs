@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::feishu::cards::*;
-use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
+use crate::feishu::events::{BotAdded, CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
 use crate::game::{*, Persona};
 use crate::llm::{AiDecision, DecisionContext, LlmClient};
@@ -663,6 +663,38 @@ impl Bot {
             {
                 warn!(?e, open_id = %user.open_id, "failed to send welcome ephemeral");
             }
+        }
+        Ok(())
+    }
+
+    /// Fired when **the bot itself** is pulled into a new group. Posts a
+    /// public welcome card so the room knows what just got added and how to
+    /// kick off a game without anyone having to read README.
+    ///
+    /// Multi-tenancy: all game state is keyed by `chat_id`, so a single
+    /// bot deployment serves any number of groups concurrently. Combined
+    /// with leaving `ALLOWED_CHAT_ID` unset, this handler is the entire
+    /// "drop bot in any group, it just works" experience.
+    pub async fn handle_bot_added(self: Arc<Self>, evt: BotAdded) -> Result<()> {
+        if self.is_duplicate_event(&evt.event_id) {
+            return Ok(());
+        }
+        // Honour the ALLOWED_CHAT_ID lock for backwards compat — single-group
+        // operators who set this env clearly don't want the bot acting on
+        // unrelated groups even if Feishu accidentally drops it into one.
+        if let Some(allowed) = &self.cfg.allowed_chat_id {
+            if &evt.chat_id != allowed {
+                info!(chat_id = %evt.chat_id, "bot added to non-allowed chat, ignoring");
+                return Ok(());
+            }
+        }
+        let card = build_bot_added_welcome_card(self.llm.is_some(), &evt.operator_open_id);
+        if let Err(e) = self
+            .client
+            .send_message("chat_id", &evt.chat_id, "interactive", &card)
+            .await
+        {
+            warn!(?e, chat_id = %evt.chat_id, "failed to send bot-added welcome");
         }
         Ok(())
     }
@@ -1809,6 +1841,53 @@ fn build_welcome_card(chat_id: &str, name: &str) -> Value {
             )),
             button_row(vec![button("加入下一局", v, "primary_filled")]),
             note("这条消息仅你可见，不想玩可以直接忽略。"),
+        ],
+    )
+}
+
+/// Public welcome card posted into a group the moment the bot is added —
+/// triggered by `im.chat.member.bot.added_v1`. Goal: a player who never
+/// read the README can immediately see what's available and how to start.
+///
+/// Visible to everyone in the group (not ephemeral), because the reaction
+/// "what is this bot" belongs to the whole room, not just the inviter.
+fn build_bot_added_welcome_card(ai_enabled: bool, inviter_open_id: &str) -> Value {
+    let inviter_line = if inviter_open_id.is_empty() {
+        "**夜局** 已加入本群 🎉".to_string()
+    } else {
+        format!(
+            "感谢 {} 把我拉进群 🎉",
+            at(inviter_open_id)
+        )
+    };
+    let ai_blurb = if ai_enabled {
+        "· 人不够还能 [加入 AI] 凑桌（DeepSeek/OpenAI 驱动的 LLM 玩家）"
+    } else {
+        "· 部署方设了 OPENAI_API_KEY 可解锁 AI 凑桌"
+    };
+    card(
+        header_with_subtitle(
+            "🎰🐺 夜局 · 上线",
+            "饭后约一局 · 飞书群里玩德州 + 狼人杀",
+            "turquoise",
+        ),
+        vec![
+            markdown(&inviter_line),
+            hr(),
+            markdown(
+                "**怎么开局**\n\
+                 - `@机器人 帮助` 看完整命令列表\n\
+                 - `/poker` 或 `@机器人 加入` 开德州\n\
+                 - `/wolf` 或 `@机器人 狼` 开狼人杀\n\
+                 - 任何时候 `@机器人 重置` 清空牌桌"
+            ),
+            markdown(
+                "**两种模式简介**\n\
+                 - 🎰 **德州扑克**: 多人持续筹码、边池、全押、6+ 短牌; 初始 1000 筹码\n\
+                 - 🐺 **狼人杀**: 9-12 人板娘; 狼/狼王/预/女/猎/守/民, 屠城规则"
+            ),
+            note(ai_blurb),
+            note("手牌 / 身份 / 投票走 ephemeral 私密卡片, 仅本人可见 · 群聊不刷屏"),
         ],
     )
 }

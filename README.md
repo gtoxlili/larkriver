@@ -1,10 +1,10 @@
-# lark-arena · 飞书群聊 AI 牌局机器人
+# 夜局 · 飞书群聊 AI 牌局机器人
 
-> 飞书群里玩 **德州扑克** + **狼人杀**，人不够用 **AI 玩家**凑（DeepSeek / OpenAI / Doubao 都能接）。一行 docker 起服务，群里 @ 一下机器人就开局。
+> **夜局**(`lark-arena`)—— 饭后约一局,在飞书群里玩 **德州扑克** + **狼人杀**,人不够用 **AI 玩家**凑（DeepSeek / OpenAI / Doubao 都能接）。一行 docker 起服务,把 bot 拉进任意群,@ 一下就开局。
 
-> A multi-game arena bot for **Feishu (Lark)** group chats — runs **Texas Hold'em** and **Werewolf / Mafia** sessions where empty seats are filled by **LLM-driven AI players**. Single static binary, JSON 2.0 interactive cards, persistent chip stacks via redb.
+> *Yejú* (lit. "night session", project codename `lark-arena`) is a multi-game arena bot for **Feishu (Lark)** group chats — runs **Texas Hold'em** and **Werewolf / Mafia** sessions where empty seats are filled by **LLM-driven AI players**. Single static binary, JSON 2.0 interactive cards, persistent chip stacks via redb. Drop the bot into any group; it just works.
 
-**关键词 / Keywords**: 飞书机器人, Lark bot, 飞书 AI 玩家, 飞书德州扑克, 飞书狼人杀, Texas Hold'em poker bot, Werewolf game bot, group chat AI agent, LLM poker, DeepSeek bot, Rust + axum.
+**关键词 / Keywords**: 飞书机器人, Lark bot, 飞书 AI 玩家, 飞书德州扑克, 飞书狼人杀, 飞书桌游, 群聊游戏, Texas Hold'em poker bot, Werewolf / Mafia game bot, group chat AI agent, LLM poker, DeepSeek bot, Rust + axum.
 
 ## 特性 · Features
 
@@ -19,6 +19,8 @@
 
 ### 1. 拉镜像并运行
 
+**默认多群模式** —— 机器人会响应所有把它拉进群的飞书群,各群游戏状态独立按 `chat_id` 分桶,互不干扰。
+
 ```bash
 docker pull ghcr.io/gtoxlili/lark-arena:latest
 
@@ -27,18 +29,21 @@ docker run -d \
   --restart unless-stopped \
   -e FEISHU_APP_ID=<your_app_id> \
   -e FEISHU_APP_SECRET=<your_app_secret> \
-  -e ALLOWED_CHAT_ID=<oc_xxx> \
   -e BIND_ADDR=0.0.0.0:8080 \
   -e RUST_LOG=lark_arena=info,tower_http=info \
+  -e LARK_ARENA_DB_PATH=/data/arena.redb \
+  -v lark-arena-data:/data \
   -p 8080:8080 \
   ghcr.io/gtoxlili/lark-arena:latest
 ```
+
+> 想锁单群测试?加上 `-e ALLOWED_CHAT_ID=oc_xxx`,只有那个群的事件被处理,其他群一律忽略。生产部署不建议设这个。
 
 ### 2. 飞书后台配置
 
 在 [飞书开放平台](https://open.feishu.cn/app) 新建企业自建应用，添加机器人能力。
 
-**权限管理**
+**权限管理**(租户级,加完一次所有群通用)
 
 | Scope | 用途 |
 | --- | --- |
@@ -51,9 +56,13 @@ docker run -d \
 
 - 订阅方式：将事件发送至开发者服务器
 - 请求地址：`http://<your-server>:8080/webhook/event`
-- 订阅事件：
-  - `im.message.receive_v1`
-  - `im.chat.member.user.added_v1`
+- 订阅事件:
+
+| 事件 | 用途 |
+| --- | --- |
+| `im.message.receive_v1` | 接收群里所有 `@机器人 …` / `/poker` / `/wolf` 命令 |
+| `im.chat.member.user.added_v1` | 普通用户进群,bot 给该用户发个 ephemeral 玩法提示 |
+| `im.chat.member.bot.added_v1` | **机器人自己**被拉进新群时,在群里发欢迎卡 + 玩法说明(让群成员立刻知道 bot 能干啥) |
 
 不要在事件配置页订阅 `card.action.trigger`。
 
