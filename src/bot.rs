@@ -4,7 +4,7 @@ use crate::feishu::events::{CardAction, InboundMessage, MemberAdded, Mention};
 use crate::feishu::Client as FeishuClient;
 use crate::game::{*, Persona};
 use crate::llm::{AiDecision, DecisionContext, LlmClient};
-use crate::poker::{category_name, DeckMode};
+use crate::poker::{best_five, category_name, Card, DeckMode};
 use crate::storage::Store;
 use crate::werewolf::WolfGame;
 
@@ -2004,11 +2004,15 @@ fn build_lobby_card(
 /// rendered into an ephemeral message sent to the actor themselves.
 /// Hero stats embedded into the state card for the viewing player. None when
 /// the snapshot has no hole cards (public state card, or non-player viewer).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ViewerStats {
     pub equity: f64,
     pub pot: u64,
     pub to_call: u64,
+    /// Pretty label for the viewer's current made hand (hole + community).
+    /// `None` pre-flop unless we can describe a pocket pair / suited hand —
+    /// with fewer than 5 known cards there's no real "best five" yet.
+    pub made_hand: Option<String>,
 }
 
 /// Build the equity / pot-odds / EV bundle for a snapshot's viewer. Returns
@@ -2035,11 +2039,66 @@ fn compute_viewer_stats(
         .find(|p| p.open_id == viewer_open_id)
         .map(|p| snap.current_bet.saturating_sub(p.bet_in_round))
         .unwrap_or(0);
+    let made_hand = describe_made_hand(&snap.viewer_hole, &snap.community, snap.mode);
     Some(ViewerStats {
         equity,
         pot: snap.pot,
         to_call,
+        made_hand,
     })
+}
+
+/// Friendly label for the actor's strongest 5-card hand using their hole
+/// cards + the visible community.
+///
+/// - **Pre-flop** (community empty, only 2 hole cards): we can't form a 5-card
+///   hand yet, but a pocket pair / suited / connected starting hand is worth
+///   surfacing because it's exactly what a player thinks about pre-flop.
+/// - **Flop+** (≥ 5 known cards): runs `best_five` and renders
+///   `<category> · <top kicker>` — e.g. `两对 · A`, `葫芦 · K`, `同花 · A`.
+///   For straight / straight-flush variants we use the straight's high card,
+///   which is what the kicker stores.
+fn describe_made_hand(hole: &[Card], community: &[Card], mode: DeckMode) -> Option<String> {
+    if hole.len() < 2 {
+        return None;
+    }
+    let total = hole.len() + community.len();
+    if total < 5 {
+        // Pre-flop labelling: only fire on signal-rich starting hands so we
+        // don't drown players in obvious "高牌 K" lines every preflop.
+        if hole[0].rank == hole[1].rank {
+            return Some(format!("口袋对 · **{}**", hole[0].rank.label()));
+        }
+        let suited = hole[0].suit == hole[1].suit;
+        let r1 = hole[0].rank.0 as i16;
+        let r2 = hole[1].rank.0 as i16;
+        let connected = (r1 - r2).abs() == 1;
+        match (suited, connected) {
+            (true, true) => Some("同花连张".into()),
+            (true, false) => Some("同花".into()),
+            (false, true) => Some("连张".into()),
+            (false, false) => None,
+        }
+    } else {
+        let mut all: Vec<Card> = Vec::with_capacity(total);
+        all.extend_from_slice(hole);
+        all.extend_from_slice(community);
+        let (rank, _) = best_five(&all, mode);
+        let cat = category_name(rank.category, mode);
+        let primary = rank.kickers[0];
+        if primary >= 2 && primary <= 14 {
+            let label = match primary {
+                14 => "A".to_string(),
+                13 => "K".to_string(),
+                12 => "Q".to_string(),
+                11 => "J".to_string(),
+                n => n.to_string(),
+            };
+            Some(format!("**{}** · {}", cat, label))
+        } else {
+            Some(format!("**{}**", cat))
+        }
+    }
 }
 
 fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_buttons: bool) -> Value {
@@ -2156,10 +2215,17 @@ fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_bu
     )
 }
 
-/// `胜率 47% · 底池赔率 21% · 跟注 EV +12` — pot odds & EV only when there's
-/// a non-zero call to make.
+/// `牌型 两对·A | 胜率 47% · 底池赔率 21% · 跟注 EV +12` — made-hand label
+/// goes first (most actionable info to a human eye-balling the card), then
+/// equity/pot-odds/EV. Pot odds & EV only render when there's a non-zero
+/// call to make. Made-hand only renders when we have one to report.
 fn render_stats_line(s: &ViewerStats) -> String {
-    let mut line = format!("胜率 **{:.0}%**", s.equity * 100.0);
+    let mut line = String::new();
+    if let Some(hand) = &s.made_hand {
+        line.push_str(&format!("牌型 {}", hand));
+        line.push_str(" | ");
+    }
+    line.push_str(&format!("胜率 **{:.0}%**", s.equity * 100.0));
     if s.to_call > 0 {
         let pot_after = (s.pot + s.to_call) as f64;
         let pot_odds = s.to_call as f64 / pot_after;
