@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---------- planner: hash the dependency graph (cargo-chef recipe) ----------
-FROM lukemathwalker/cargo-chef:latest-rust-latest AS chef
+# Pin the builder to Debian bookworm (glibc 2.36) so the linked binary stays
+# compatible with our `distroless/cc-debian12` runtime. The `*-rust-latest`
+# tag silently follows Debian's stable cut and once Trixie (glibc 2.38)
+# became upstream-stable the produced binary stopped loading on bookworm
+# with `GLIBC_2.38 not found`. Pinning the OS layer keeps the toolchain
+# moving forward without dragging the libc floor with it.
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
 WORKDIR /app
 
 FROM chef AS planner
