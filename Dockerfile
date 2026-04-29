@@ -27,7 +27,7 @@ FROM source AS test
 RUN cargo test --locked
 
 # ---------- builder: depends on test, so tests must pass before binary build.
-# Reuses the cooked release deps; only the larkriver crate links here.
+# Reuses the cooked release deps; only the lark-arena crate links here.
 FROM test AS builder
 RUN cargo build --release --locked
 # An empty stub directory we can COPY --chown into the runtime image so /data
@@ -41,16 +41,18 @@ RUN mkdir -p /datadir
 # `panic = unwind` dlopens libgcc_s.so.1 at runtime; without it the binary
 # fails to start with "error while loading shared libraries: libgcc_s.so.1".
 FROM gcr.io/distroless/cc-debian13:nonroot
-COPY --from=builder /app/target/release/larkriver /app/larkriver
+COPY --from=builder /app/target/release/lark-arena /app/lark-arena
 # Pre-create /data owned by uid 65532 (`nonroot`). When users mount a fresh
 # named docker volume here, Docker initialises it from this directory and
-# preserves the ownership — so redb can actually write to /data/larkriver.redb.
+# preserves the ownership — so redb can actually write to /data/arena.redb.
 # Without this, named volumes inherit root ownership and the bot crashes on
 # startup with "Permission denied" trying to open the database file.
 COPY --from=builder --chown=nonroot:nonroot /datadir /data
 
 EXPOSE 8080
-ENV RUST_LOG=larkriver=info,tower_http=info \
+# Env-filter target uses the crate name with hyphens turned into underscores
+# (Rust identifier rules), so `lark_arena=info` not `lark-arena=info`.
+ENV RUST_LOG=lark_arena=info,tower_http=info \
     BIND_ADDR=0.0.0.0:8080
 
-ENTRYPOINT ["/app/larkriver"]
+ENTRYPOINT ["/app/lark-arena"]

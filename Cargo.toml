@@ -1,9 +1,15 @@
 [package]
-name = "larkriver"
-version = "0.2.0"
+name = "lark-arena"
+version = "0.3.0"
 edition = "2024"
-description = "Texas Hold'em + Werewolf bot for Feishu (Lark) — 2026 aggressive rewrite"
+description = "Feishu (Lark) group-chat AI game arena — Texas Hold'em + Werewolf, LLM-driven AI seats"
 rust-version = "1.85"
+license = "GPL-3.0"
+repository = "https://github.com/gtoxlili/lark-arena"
+homepage = "https://github.com/gtoxlili/lark-arena"
+readme = "README.md"
+keywords = ["feishu", "lark", "poker", "werewolf", "llm"]
+categories = ["games", "command-line-utilities"]
 
 [dependencies]
 # --- async runtime / web -------------------------------------------------

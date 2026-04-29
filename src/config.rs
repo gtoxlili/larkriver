@@ -30,8 +30,8 @@ impl Config {
                 .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
             openai_model: env_opt("OPENAI_MODEL")
                 .unwrap_or_else(|| "deepseek-v4-flash".to_string()),
-            db_path: env_opt("LARKRIVER_DB_PATH")
-                .unwrap_or_else(|| "larkriver.redb".to_string()),
+            db_path: env_opt("LARK_ARENA_DB_PATH")
+                .unwrap_or_else(|| "arena.redb".to_string()),
         })
     }
 }

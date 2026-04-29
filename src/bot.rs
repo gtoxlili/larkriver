@@ -1167,7 +1167,7 @@ impl Bot {
 
     /// Debug: 构造一个 8 玩家（4 真人 + 4 AI）的代表性大厅快照，把按钮换行 /
     /// 间距 / 配色 在真实卡片上跑一遍，发到 `recipient_open_id` 的 ephemeral。
-    /// 用法：`larkriver --debug-lobby <name|open_id>`，迭代 UI 不需要重新部署。
+    /// 用法：`lark-arena --debug-lobby <name|open_id>`，迭代 UI 不需要重新部署。
     ///
     /// 真人玩家的 open_id 全部用 recipient 自己 + bot 自己（display_name 会渲染
     /// 成 `<at>` 标签，飞书校验里假 open_id 会触发 18054 internal error）。

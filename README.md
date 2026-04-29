@@ -1,30 +1,37 @@
-# larkriver
+# lark-arena · 飞书群聊 AI 牌局机器人
 
-飞书群聊游戏机器人——支持德州扑克 + 狼人杀两种模式。
+> 飞书群里玩 **德州扑克** + **狼人杀**，人不够用 **AI 玩家**凑（DeepSeek / OpenAI / Doubao 都能接）。一行 docker 起服务，群里 @ 一下机器人就开局。
 
-- **德州扑克**：多玩家、边池、全押、6+ 短牌
-- **狼人杀**：9-12 人、狼/狼王/预/女/猎/守/民、屠城规则、上警警徽流转
-- 卡片 JSON 2.0：手牌方块、加注 form 输入、按钮分级
-- 手牌 / 身份 / 夜间技能 / 投票 通过 ephemeral 群消息发送（仅本人可见，无需私聊机器人）
-- 行动卡 ephemeral 给当前 actor，其他人只看公开公告
+> A multi-game arena bot for **Feishu (Lark)** group chats — runs **Texas Hold'em** and **Werewolf / Mafia** sessions where empty seats are filled by **LLM-driven AI players**. Single static binary, JSON 2.0 interactive cards, persistent chip stacks via redb.
+
+**关键词 / Keywords**: 飞书机器人, Lark bot, 飞书 AI 玩家, 飞书德州扑克, 飞书狼人杀, Texas Hold'em poker bot, Werewolf game bot, group chat AI agent, LLM poker, DeepSeek bot, Rust + axum.
+
+## 特性 · Features
+
+- **德州扑克 (Texas Hold'em)**：多玩家、边池 (side pots)、全押 (all-in)、6+ 短牌 (6+ short deck)
+- **狼人杀 (Werewolf / Mafia)**：9-12 人板娘、狼 / 狼王 / 预言家 / 女巫 / 猎人 / 守卫 / 村民、屠城判定、上警警徽流转、自刀策略
+- **AI 玩家 (LLM-driven seats)**：每个 AI 都有人设 (莽哥/老炮/跟注站/老抠/头铁)，跟人打感觉不像跟机器打。可叠加多个，一桌混合人 + AI
+- **卡片 JSON 2.0**：手牌方块、加注 form 输入、按钮分级、ephemeral 私密卡片（仅当前 actor 可见，群里其他人只看公开公告）
+- **持久化**：redb 嵌入式 ACID 数据库，重启不丢筹码 / 不丢身份 / 不丢局
+- **2026 极致性能栈**：Rust 2024 edition · mimalloc 全局 allocator · sonic-rs SIMD JSON · foldhash · fastrand · rayon 并行 Monte Carlo equity · u64 bitmask 7 张直评器 · arc-swap 无锁 token 缓存
 
 ## 部署
 
 ### 1. 拉镜像并运行
 
 ```bash
-docker pull ghcr.io/gtoxlili/larkriver:latest
+docker pull ghcr.io/gtoxlili/lark-arena:latest
 
 docker run -d \
-  --name larkriver \
+  --name lark-arena \
   --restart unless-stopped \
   -e FEISHU_APP_ID=<your_app_id> \
   -e FEISHU_APP_SECRET=<your_app_secret> \
   -e ALLOWED_CHAT_ID=<oc_xxx> \
   -e BIND_ADDR=0.0.0.0:8080 \
-  -e RUST_LOG=larkriver=info,tower_http=info \
+  -e RUST_LOG=lark_arena=info,tower_http=info \
   -p 8080:8080 \
-  ghcr.io/gtoxlili/larkriver:latest
+  ghcr.io/gtoxlili/lark-arena:latest
 ```
 
 ### 2. 飞书后台配置
@@ -157,7 +164,7 @@ docker run -d \
 ## 注意事项
 
 - 卡片 JSON 2.0 要求 Lark 客户端 v7.20+
-- 游戏状态持久化到 redb（`LARKRIVER_DB_PATH`，默认 `larkriver.redb`），筹码 / 玩家 / AI 座位重启不丢
+- 游戏状态持久化到 redb（`LARK_ARENA_DB_PATH`，默认 `arena.redb`），筹码 / 玩家 / AI 座位重启不丢
 - 进行中的一手牌如果在容器重启之间被打断，下次 `[开局]` 会按"卡住"处理：退还场上筹码 + 重新发牌
 - 牌局卡住用 `/poker reset` 手动重置
 - 双层去重抗飞书重投：`event_id`（120s 窗口） + `(open_id, value)` 指纹（3s 窗口）
@@ -191,8 +198,8 @@ src/
 ## 开发
 
 ```bash
-git clone https://github.com/gtoxlili/larkriver
-cd larkriver
+git clone https://github.com/gtoxlili/lark-arena
+cd lark-arena
 cp .env.example .env
 cargo run --release
 cargo test
@@ -201,12 +208,12 @@ cargo test
 把所有卡片样式发到 `ALLOWED_CHAT_ID` 看效果：
 
 ```bash
-./target/release/larkriver --mock <你的 open_id>
+./target/release/lark-arena --mock <你的 open_id>
 ```
 
 ## CI 和镜像
 
-每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/larkriver:{latest, main, sha-<short>, v<semver>}`。
+每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/lark-arena:{latest, main, sha-<short>, v<semver>}`。
 
 Dockerfile 用 cargo-chef 缓存依赖，distroless/cc-debian12:nonroot 作运行时，最终镜像约 30 MB。
 
